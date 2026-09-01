@@ -251,6 +251,16 @@ class Pi0Config(_model.BaseModelConfig):
     memory_sem_injection_c: float = 12.4
     memory_sem_injection_tau: float = 0.02
     memory_sem_injection_gate_init: float = 0.5
+    # Stage 2a (V4_PLAN.md §5): write the ground-truth fact embedding
+    # L2Norm(fact_value_embed[label]) at observable E steps instead of the head's prediction,
+    # isolating commit -> retain -> read -> use from perception error. Never a training
+    # objective for the head (the head is frozen in that stage); the 2a/2b gap measures
+    # perception error.
+    memory_fact_oracle_writes: bool = False
+    # Stage 2 is semantic-only: the visual bank still writes (state evolves) but injects
+    # nothing (content ablation of the visual retrieval) so the fused stream sees only the
+    # semantic tokens. The v3.5 gate/calibration contract on the visual path is untouched.
+    memory_v4_visual_injection: bool = True
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -403,9 +413,15 @@ class Pi0Config(_model.BaseModelConfig):
                 if not self.memory_time_consistent_augmentation:
                     raise ValueError("v3.5 requires time-consistent sequence augmentation.")
             if not self.memory_v4_dual_bank and (
-                self.memory_fact_loss_weight > 0 or self.memory_fact_read_loss_weight > 0
+                self.memory_fact_loss_weight > 0
+                or self.memory_fact_read_loss_weight > 0
+                or self.memory_fact_oracle_writes
+                or not self.memory_v4_visual_injection
             ):
-                raise ValueError("v4 fact losses require memory_v4_dual_bank=True.")
+                raise ValueError(
+                    "v4 fact losses require memory_v4_dual_bank=True (as do oracle writes and the "
+                    "visual-injection switch)."
+                )
             if self.memory_v4_dual_bank:
                 if not self.memory_v35_enabled:
                     raise ValueError(

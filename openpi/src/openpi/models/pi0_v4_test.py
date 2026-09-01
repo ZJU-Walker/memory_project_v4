@@ -205,6 +205,7 @@ class _TinyV4Seq(_TinyV35):
     _v4_fact_slots = pi0.Pi0._v4_fact_slots
     v4_fact_logits = pi0.Pi0.v4_fact_logits
     v4_fact_write_intent = pi0.Pi0.v4_fact_write_intent
+    v4_fact_oracle_intent = pi0.Pi0.v4_fact_oracle_intent
     v4_semantic_write = pi0.Pi0.v4_semantic_write
     v4_semantic_read = pi0.Pi0.v4_semantic_read
     v4_fact_read_logits = pi0.Pi0.v4_fact_read_logits
@@ -300,6 +301,43 @@ def test_v4_sequence_commits_confident_slots_supervises_facts_and_reads_back(tin
     # The D-step retrieval is live: three commits decayed over the sparse gap still read
     # clearly above zero.
     assert float(losses["v4_sem_raw_read_rms_sum"]) > 0.0
+    assert float(losses["v4_sem_injected_pre_cast_rms_sum"]) > 0.0
+    for key, value in losses.items():
+        assert np.isfinite(np.asarray(value)).all(), key
+
+
+def test_oracle_intent_embeds_the_truth_and_only_for_eligible_real_slots(tiny_v4_seq):
+    targets = jnp.asarray([[0, 1, 2], [1, 0, 0]], dtype=jnp.int32)
+    slot_mask = jnp.asarray([[True, True, True], [True, False, True]])
+    intent = tiny_v4_seq.v4_fact_oracle_intent(targets, slot_mask)
+    # `unknown` (2) and masked-off slots are never eligible; real observable slots are.
+    np.testing.assert_array_equal(
+        np.asarray(intent["write_eligible"]), np.asarray([[True, True, False], [True, False, True]])
+    )
+    embed = np.asarray(tiny_v4_seq.fact_value_embed.value)
+    expected = embed[np.asarray(targets)]
+    expected = expected / np.linalg.norm(expected, axis=-1, keepdims=True)
+    np.testing.assert_allclose(np.asarray(intent["values"]), expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(np.asarray(intent["confidence"]), np.ones((2, 3), dtype=np.float32))
+
+
+def test_v4_oracle_writes_commit_exactly_the_observable_real_slots(tiny_v4_seq):
+    observation = _v4_sequence_observation()
+    actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)
+    tiny_v4_seq.memory_fact_oracle_writes = True
+    tiny_v4_seq.memory_v4_visual_injection = False
+    try:
+        losses = tiny_v4_seq._compute_sequence_loss_v32(jax.random.key(46), observation, actions, train=False)
+    finally:
+        tiny_v4_seq.memory_fact_oracle_writes = False
+        tiny_v4_seq.memory_v4_visual_injection = True
+    # Slots 0/1 are observable real facts on the E step -> exactly 2 oracle commits (the
+    # deterministic head would have committed all 3 in predicted mode).
+    np.testing.assert_array_equal(losses["v4_sem_commit_count"], 2.0)
+    np.testing.assert_array_equal(losses["v4_sem_write_eligible_count"], 2.0)
+    # Semantic-only: the visual bank still commits (state evolves) but injects nothing.
+    np.testing.assert_array_equal(losses["v35_commit_success_count"], 1.0)
+    np.testing.assert_array_equal(losses["v35_injected_pre_cast_rms_sum"], 0.0)
     assert float(losses["v4_sem_injected_pre_cast_rms_sum"]) > 0.0
     for key, value in losses.items():
         assert np.isfinite(np.asarray(value)).all(), key

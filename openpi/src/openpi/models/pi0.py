@@ -593,6 +593,8 @@ class Pi0(_model.BaseModel):
                 self.memory_fact_read_loss_weight = config.memory_fact_read_loss_weight
                 self.memory_sem_injection_c = config.memory_sem_injection_c
                 self.memory_sem_injection_tau = config.memory_sem_injection_tau
+                self.memory_fact_oracle_writes = config.memory_fact_oracle_writes
+                self.memory_v4_visual_injection = config.memory_v4_visual_injection
                 # Independent fast-memory instance: one bank can never overwrite the other. It
                 # is driven purely through the key-space API (delta_write_kv_multi/read_key);
                 # its W_K/W_V/W_Q/gate leaves exist only for tree uniformity and are never
@@ -834,19 +836,65 @@ class Pi0(_model.BaseModel):
         }
 
     @at.typecheck
+    def v4_fact_oracle_intent(
+        self,
+        targets: at.Int[at.Array, "b f"],
+        slot_mask: at.Bool[at.Array, "b f"],
+    ) -> dict[str, at.Array]:
+        """Stage-2a oracle write content: the ground-truth target's own embedding.
+
+        ``values = L2Norm(fact_value_embed[target])`` -- the same embedding table and
+        normalization the predicted path uses, so oracle and predicted writes differ ONLY in
+        the distribution being embedded (one-hot truth vs the head's softmax). A slot is
+        eligible when ``slot_mask`` holds (populated AND observable at this step) and the
+        target is a real, non-``unknown`` class.
+        """
+        unknown = self.memory_fact_targets - 1
+        safe = jnp.clip(targets, 0, self.memory_fact_targets - 1)
+        onehot = jax.nn.one_hot(safe, self.memory_fact_targets, dtype=jnp.float32)
+        values = _memory.l2_normalize(
+            jnp.einsum(
+                "bft,td->bfd",
+                onehot,
+                self.fact_value_embed.value.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
+        )
+        eligible = slot_mask & (targets >= 0) & (targets < self.memory_fact_targets) & (safe != unknown)
+        keys = jnp.broadcast_to(self.v4_fact_keys()[None], values.shape[:2] + (self.fact_keys.value.shape[-1],))
+        return {
+            "keys": keys.astype(jnp.float32),
+            "values": values.astype(jnp.float32),
+            "probs": onehot,
+            "confidence": jnp.ones(targets.shape, dtype=jnp.float32),
+            "predicted": safe.astype(jnp.int32),
+            "write_eligible": eligible,
+        }
+
+    @at.typecheck
     def v4_semantic_write(
         self,
         state: _memory.MemoryState,
         fact_logits: at.Float[at.Array, "b f t"],
         write_mask: at.Bool[at.Array, " b"],
+        *,
+        oracle_targets: at.Int[at.Array, "b f"] | None = None,
+        oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
     ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
         """One semantic-bank transition: decay once, commit the eligible confident slots.
 
         Like every delta transition this must run AFTER the step's reads. A sample with
         ``write_mask`` False (or no eligible slot) takes exactly one analytic decay step, so
-        the shared sparse clock stays collapsible across write-free gaps.
+        the shared sparse clock stays collapsible across write-free gaps. With
+        ``oracle_targets`` (Stage 2a) the content comes from :meth:`v4_fact_oracle_intent`
+        instead of the head's prediction; ``fact_logits`` is then unused for writing.
         """
-        intent = self.v4_fact_write_intent(fact_logits)
+        if (oracle_targets is None) != (oracle_slot_mask is None):
+            raise ValueError("oracle_targets and oracle_slot_mask must be provided together.")
+        if oracle_targets is not None:
+            intent = self.v4_fact_oracle_intent(oracle_targets, oracle_slot_mask)
+        else:
+            intent = self.v4_fact_write_intent(fact_logits)
         commit = intent["write_eligible"] & write_mask[:, None]
         new_state, aux = self.memory_semantic.delta_write_kv_multi(
             state, intent["keys"], intent["values"], commit
@@ -1066,7 +1114,9 @@ class Pi0(_model.BaseModel):
             )
         write_tokens = self.write_query_compressor(h8_top, queries=write_queries, source_valid=source_valid)
         retrieved = self.memory.read(memory_state, read_queries)
-        if zero_read:
+        if zero_read or (v4_on and not getattr(self, "memory_v4_visual_injection", True)):
+            # zero_read: diagnostics content ablation. v4 visual-injection switch (Stage 2,
+            # semantic-only): the visual bank keeps writing/evolving but injects nothing.
             retrieved = jnp.zeros_like(retrieved)
         if oracle_active:
             # The oracle pins only the 16 VISUAL slots; a v4 semantic block, when present,
@@ -4410,9 +4460,19 @@ class Pi0(_model.BaseModel):
                     # Semantic transition: decay once, commit the confident eligible slots on
                     # E steps (v4_semantic_write ANDs eligibility with write_requested).
                     # Invalid/padded steps keep the exact previous state, like the visual bank.
-                    sem_write_state, sem_aux = self.v4_semantic_write(
-                        sem_state, write_fact_logits, write_requested
-                    )
+                    # Stage 2a: oracle content, gated per slot on populated AND observable.
+                    if getattr(self, "memory_fact_oracle_writes", False):
+                        sem_write_state, sem_aux = self.v4_semantic_write(
+                            sem_state,
+                            write_fact_logits,
+                            write_requested,
+                            oracle_targets=fact_labels,
+                            oracle_slot_mask=x["fact_observable"] & fact_label_real,
+                        )
+                    else:
+                        sem_write_state, sem_aux = self.v4_semantic_write(
+                            sem_state, write_fact_logits, write_requested
+                        )
                     sem_state = jax.tree.map(
                         lambda new, old: jnp.where(
                             transition_valid.reshape((b,) + (1,) * (new.ndim - 1)), new, old
