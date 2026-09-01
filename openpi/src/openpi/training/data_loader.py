@@ -260,6 +260,11 @@ def create_torch_dataset(
                     episode_waiting_valid=info.get("episode_waiting_valid", ()),
                 )
             )
+        fact_targets_table = None
+        if data_config.memory_v4_fact_labels_path is not None:
+            if "stable_id" not in info:
+                raise ValueError("v4 fact labels require the v3.5 frozen episode manifest (stable identities).")
+            fact_targets_table = _load_v4_fact_labels(data_config, stable_ids=info["stable_id"])
         seq_transforms.append(
             _transforms.MemoryEpisodeInfo(
                 episode_length=info["length"],
@@ -269,6 +274,7 @@ def create_torch_dataset(
                 episode_memory_window=_memory_critical_windows(info, data_config),
                 # v3.4 ladder-probe side label; dropped at repack unless the config carries it.
                 episode_side_label=info["side"],
+                episode_fact_targets=fact_targets_table,
             )
         )
         dataset = TransformedDataset(dataset, seq_transforms)
@@ -1007,6 +1013,62 @@ def _load_v35_episode_manifest(
         "manifest_d_lo": manifest_d_lo,
         "manifest_d_hi": manifest_d_hi,
     }
+
+
+_V4_FACT_LABELS_SCHEMA_VERSION = "openpi.v4.fact-labels.v1"
+
+
+def _load_v4_fact_labels(
+    data_config: "_config.DataConfig",
+    *,
+    stable_ids: tuple[str, ...],
+) -> np.ndarray:
+    """Load and fail-closed validate the derived v4 fact-label sidecar.
+
+    Returns [num_episodes, real_fact_slots] int32 target ids aligned with the LeRobot episode
+    indices via the manifest ``stable_id`` order. The sidecar is authenticated three ways: the
+    pinned file SHA256, its own content self-hash, and its recorded source-manifest SHA256
+    against the same frozen-manifest pin the v3.5 population loader enforces.
+    """
+    path_value = data_config.memory_v4_fact_labels_path
+    if path_value is None:
+        raise ValueError("v4 fact-label sidecar path is not configured.")
+    path = pathlib.Path(path_value)
+    if not path.is_file():
+        raise ValueError(f"v4 fact-label sidecar does not exist: {path}")
+    raw = path.read_bytes()
+    expected_sha256 = data_config.memory_v4_fact_labels_sha256
+    if expected_sha256 is None:
+        raise ValueError("the v4 fact-label sidecar requires an exact pinned SHA256.")
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(f"v4 fact-label sidecar SHA256 mismatch: expected {expected_sha256}, got {actual_sha256}.")
+    payload = json.loads(raw)
+    if payload.get("schema_version") != _V4_FACT_LABELS_SCHEMA_VERSION:
+        raise ValueError(f"unsupported v4 fact-label schema: {payload.get('schema_version')!r}.")
+    body = {key: value for key, value in payload.items() if key != "content_sha256"}
+    canonical = json.dumps(body, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != payload.get("content_sha256"):
+        raise ValueError("v4 fact-label sidecar failed its content self-hash.")
+    if payload.get("source_manifest_sha256") != data_config.memory_episode_manifest_sha256:
+        raise ValueError(
+            "v4 fact-label sidecar was derived from a different manifest than the configured frozen population."
+        )
+    num_targets = len(payload["target_vocab"])
+    unknown = int(payload["unknown_target"])
+    records = payload["episodes"]
+    rows = []
+    for stable_id in stable_ids:
+        record = records.get(stable_id)
+        if record is None:
+            raise ValueError(f"v4 fact-label sidecar is missing episode {stable_id!r}.")
+        targets = np.asarray(record["fact_targets"], dtype=np.int32)
+        if np.any((targets < 0) | (targets >= num_targets)) or np.any(targets == unknown):
+            raise ValueError(f"episode {stable_id!r} has out-of-range or `unknown` derived fact targets.")
+        rows.append(targets)
+    table = np.stack(rows, axis=0)
+    logging.info("v4 fact labels: %d episodes x %d slots from %s", table.shape[0], table.shape[1], path.name)
+    return table
 
 
 def _episode_info_table(

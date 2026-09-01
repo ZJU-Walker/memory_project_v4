@@ -205,6 +205,12 @@ class DataConfig:
     # registered v3.5 launch must set it true and then satisfy 70 = 54/8/8 and eight cells.
     memory_v35_frozen_population: bool = False
 
+    # v4 (V4_PLAN.md): the derived fact-label sidecar (scripts/v4_build_fact_labels.py) and
+    # its exact pinned bytes. Both None for every v3.x config; when set, the loader attaches
+    # per-episode fact targets and the MemoryV4FactLabels transform emits the model fields.
+    memory_v4_fact_labels_path: str | None = None
+    memory_v4_fact_labels_sha256: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -253,6 +259,13 @@ class DataConfig:
                 raise ValueError("v3.5 frozen population requires the exact lower-case manifest SHA256.")
             if self.memory_manifest_split_seed != 36:
                 raise ValueError("v36 freezes split_seed=36.")
+        if self.memory_v4_fact_labels_path is not None:
+            if self.memory_v4_fact_labels_sha256 is None:
+                raise ValueError("the v4 fact-label sidecar requires an exact pinned SHA256.")
+            if self.memory_episode_manifest_sha256 is None:
+                raise ValueError(
+                    "v4 fact labels require the frozen manifest SHA256 pin (the sidecar cross-checks it)."
+                )
 
 
 class GroupFactory(Protocol):
@@ -579,6 +592,12 @@ class LeRobotYamDataConfig(DataConfigFactory):
             or getattr(model_config, "memory_state_mask_prob", 0.0) > 0
             or getattr(model_config, "memory_ladder_probes", False)
         )
+        use_v4_facts = use_memory and base_config.memory_v4_fact_labels_path is not None
+        if use_memory and getattr(model_config, "memory_v4_dual_bank", False) != use_v4_facts:
+            raise ValueError(
+                "memory_v4_dual_bank and memory_v4_fact_labels_path must be enabled together "
+                "(the model needs seq_fact_labels exactly when the data pipeline emits them)."
+            )
         if use_memory:
             # sequence bookkeeping (attached by MemoryEpisodeInfo / present on raw items)
             structure["frame_index"] = "frame_index"
@@ -586,6 +605,8 @@ class LeRobotYamDataConfig(DataConfigFactory):
             structure["episode_length"] = "episode_length"
             if base_config.memory_required_subtasks and base_config.evidence_subtasks:
                 structure["memory_window"] = "memory_window"
+        if use_v4_facts:
+            structure["episode_fact_targets"] = "episode_fact_targets"
         if use_quiz:
             structure.update({key: key for key in ("quiz_side", "reveal_frame", "close_frame")})
         if use_v34_labels:
@@ -608,6 +629,18 @@ class LeRobotYamDataConfig(DataConfigFactory):
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(structure)])
 
         input_transforms = [yam_policy.YamInputs(model_type=model_config.model_type)]
+        if use_v4_facts:
+            if not use_v34_labels:
+                raise ValueError("v4 fact labels require the v3.5 label pipeline (use_v34_labels).")
+            # Runs after MemoryV34Labels (consumes its seq_write_mask); inserted first so the
+            # v3.4 transform's insert(0) below lands in front of it.
+            input_transforms.insert(
+                0,
+                _transforms.MemoryV4FactLabels(
+                    num_fact_slots=model_config.memory_fact_slots,
+                    num_fact_targets=model_config.memory_fact_targets,
+                ),
+            )
         if use_v34_labels:
             input_transforms.insert(
                 0,
@@ -1903,6 +1936,229 @@ _CONFIGS = [
         num_workers=0,
         fsdp_devices=4,
     ),
+    #
+    # v4 (V4_PLAN.md): dual-bank visual + semantic memory on the frozen v36 data. The full
+    # config is the Stage-2/4 recipe; the _stage1 variant trains ONLY the fact head (every
+    # other parameter frozen) to establish visually-grounded facts before any memory training.
+    #
+    *(
+        lambda v4_model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            max_token_len=80,
+            memory_layer=8,
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            memory_query_heads=8,
+            memory_task_conditioned_write=True,
+            causal_token_len=128,
+            bf16_vocab_projection=True,
+            simulated_delay=6,
+            memory_seq_steps=40,
+            memory_block_steps=25,
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
+            memory_probe_classes=2,
+            memory=_memory.MemoryConfig(
+                mlp_l2norm=True,
+                blank_initial_output=True,
+                drift_radius=None,
+                state_cotangent_clip=10.0,
+                kv_cotangent_clip=1.0,
+                write_rule="delta_output",
+                association_mode="pooled_frame",
+                delta_rate=1.0,
+                alpha_step=0.01,
+            ),
+            memory_qk_norm=True,
+            memory_letterbox_source_hw=(480, 640),
+            memory_blind_tokens=True,
+            memory_reseed_ce=True,
+            memory_injection_mode="tanh_rms",
+            # Placeholders until the per-bank train-54 calibration (V4_PLAN.md §6).
+            memory_injection_c=1.0,
+            memory_injection_tau=0.02,
+            memory_injection_gate_init=0.5,
+            memory_freeze_injection_gate=True,
+            memory_conditioner_context="instruction_only",
+            memory_state_mask_prob=0.5,
+            memory_state_mask_dual_view=False,
+            memory_aux_loss_weight=0.0,
+            memory_ladder_probes=True,
+            memory_v35_enabled=True,
+            memory_write_side_loss_weight=0.3,
+            memory_read_side_loss_weight=0.3,
+            memory_side_feature_cotangent_clip=1.0,
+            memory_num_side_cells=8,
+            memory_time_consistent_augmentation=True,
+            memory_v35_calibrated=False,
+            memory_v35_calibration_id=None,
+            memory_v35_calibration_path=None,
+            # ---- dual bank ----
+            memory_v4_dual_bank=True,
+            memory_semantic=_memory.MemoryConfig(
+                mlp_l2norm=True,
+                blank_initial_output=True,
+                drift_radius=None,
+                state_cotangent_clip=10.0,
+                kv_cotangent_clip=1.0,
+                write_rule="delta_output",
+                association_mode="pooled_frame",
+                delta_rate=1.0,
+                alpha_step=0.01,
+            ),
+            memory_fact_slots=8,
+            memory_fact_targets=3,
+            memory_fact_write_conf=0.9,
+            memory_fact_loss_weight=0.5,
+            memory_fact_read_loss_weight=0.3,
+            # Placeholder until the per-bank calibration; the semantic retrieval RMS differs
+            # from the visual bank's, so one shared c would mis-scale one bank.
+            memory_sem_injection_c=1.0,
+            memory_sem_injection_tau=0.02,
+            memory_sem_injection_gate_init=0.5,
+        ), v4_data=LeRobotYamDataConfig(
+            repo_id=_project_paths.V35_REPO_ID,
+            base_config=DataConfig(
+                prompt_from_episode_meta=True,
+                subtask_from_task=True,
+                subtask_lookahead=15,
+                memory_stride_frames=15,
+                memory_slice_prob=0.5,
+                memory_min_slice_steps=14,
+                memory_sequence_buckets=(14, 27, 40),
+                evidence_subtasks=("inspect both bins",),
+                memory_required_subtasks=(
+                    "wait; target bin is left",
+                    "wait; target bin is right",
+                ),
+                memory_critical_prob=0.5,
+                memory_critical_start_pad=75,
+                memory_subtask_vocab=(
+                    "open both lids",
+                    "wait; target bin is left",
+                    "open left bin",
+                    "close both lids and reset arms",
+                    "inspect both bins",
+                    "open right bin",
+                    "wait; target bin is right",
+                ),
+                heldout_episodes=(),
+                memory_waiting_max_speed=4e-3,
+                memory_waiting_max_excursion=0.02,
+                memory_v35_enabled=True,
+                memory_e_tail_guard_frames=5,
+                memory_occlusion_subtasks=("close both lids and reset arms",),
+                memory_execute_subtasks=("open left bin", "open right bin"),
+                memory_sparse_skip_o_prob=0.5,
+                memory_waiting_state_dim=14,
+                memory_episode_manifest_path=str(_project_paths.project_path(_project_paths.V35_FROZEN_MANIFEST)),
+                memory_episode_manifest_sha256=("9085fe50d7b02ea65930f3647ce0413e0583a66d430484e06c60812c52af8442"),
+                memory_manifest_split="train",
+                memory_manifest_split_seed=36,
+                memory_v35_frozen_population=True,
+                memory_v4_fact_labels_path=str(_project_paths.project_path(_project_paths.V4_FACT_LABELS)),
+                memory_v4_fact_labels_sha256=("4b6027bf2cf43db992479709619e42ab1d1ddea792e0453eae6cf8091514d378"),
+                lerobot_dataset_root=str(_project_paths.project_path(_project_paths.V35_DATASET_DIR)),
+            ),
+            # Norm statistics stay pinned to the manifest's 54 training episodes (same frozen
+            # inputs as v36; copy the sealed v36 stats into the v4 assets dir before launch).
+            assets=AssetsConfig(assets_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_DIR))),
+        ): (
+            TrainConfig(
+                name="pi05_yam_mem_v4",
+                model=v4_model,
+                data=v4_data,
+                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
+                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
+                # Both banks' injection gates stay frozen after their calibrations.
+                freeze_filter=nnx_utils.PathRegex(
+                    r".*(memory/gate|memory_semantic/gate|memory_gate|memory_inject_w|memory_sem_inject_w).*"
+                ),
+                batch_size=12,
+                gradient_accumulation_steps=1,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=200,
+                    peak_lr=5e-5,
+                    decay_steps=10_000,
+                    decay_lr=5e-5,
+                ),
+                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+                memory_grad_clip=5.0,
+                ema_decay=None,
+                probe_lr=1e-2,
+                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+                    "gs://openpi-assets/checkpoints/pi05_base/params",
+                    matched_allowlist=(
+                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+                    ),
+                    fresh_init_allowlist=(
+                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+                    ),
+                ),
+                num_train_steps=1_000,
+                save_interval=250,
+                checkpoint_by_completed_updates=True,
+                checkpoint_steps=(250, 500, 1_000),
+                keep_period=250,
+                num_workers=0,
+                fsdp_devices=4,
+            ),
+            TrainConfig(
+                name="pi05_yam_mem_v4_stage1",
+                # Stage 1 (V4_PLAN.md §5): visually-grounded facts BEFORE memory training.
+                # Same model tree (checkpoints graft forward), but only the fact head trains:
+                # everything not matching fact_ is frozen, the semantic write/read losses are
+                # the fact CE alone, and both banks stay causally inert for the fact head by
+                # construction (it reads h8). Runs on a single mid-size GPU.
+                model=dataclasses.replace(
+                    v4_model,
+                    memory_fact_loss_weight=1.0,
+                    memory_fact_read_loss_weight=0.0,
+                    memory_write_side_loss_weight=1e-6,
+                    memory_read_side_loss_weight=1e-6,
+                    # tanh(0)=0 with the gate frozen: semantic injection is exactly zero for
+                    # the whole stage, so the ONLY gradient reaching fact_* is the fact CE --
+                    # CE/flow cannot shape the fact head through the injection path, keeping
+                    # the Stage-1 grounding measurement uncontaminated.
+                    memory_sem_injection_gate_init=0.0,
+                ),
+                data=v4_data,
+                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
+                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
+                # Freeze everything except the fact head family (negative lookahead).
+                freeze_filter=nnx_utils.PathRegex(r"^(?!.*fact_).*$"),
+                batch_size=4,
+                gradient_accumulation_steps=1,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=100,
+                    peak_lr=1e-4,
+                    decay_steps=4_000,
+                    decay_lr=1e-5,
+                ),
+                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+                memory_grad_clip=5.0,
+                ema_decay=None,
+                probe_lr=1e-2,
+                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+                    "gs://openpi-assets/checkpoints/pi05_base/params",
+                    matched_allowlist=(
+                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+                    ),
+                    fresh_init_allowlist=(
+                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+                    ),
+                ),
+                num_train_steps=4_000,
+                save_interval=500,
+                keep_period=500,
+                num_workers=0,
+                fsdp_devices=1,
+            ),
+        )
+    )(),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

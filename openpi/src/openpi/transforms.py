@@ -364,6 +364,9 @@ class MemoryEpisodeInfo(DataTransformFn):
     # v3.4: the per-episode answer side (0=left, 1=right, -1=unlabeled), attached independently
     # of the legacy quiz plumbing. Consumed by MemoryV34Labels for the probe-ladder labels.
     episode_side_label: np.ndarray | None = None
+    # v4: [num_episodes, real_fact_slots] int32 per-slot fact targets from the derived sidecar
+    # (data_loader._load_v4_fact_labels). Consumed by MemoryV4FactLabels.
+    episode_fact_targets: np.ndarray | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         episode = int(np.asarray(data["episode_index"]).item())
@@ -376,6 +379,8 @@ class MemoryEpisodeInfo(DataTransformFn):
             out["episode_side"] = np.int32(self.episode_side_label[episode])
         if self.episode_memory_window is not None:
             out["memory_window"] = self.episode_memory_window[episode].astype(np.int32)
+        if self.episode_fact_targets is not None:
+            out["episode_fact_targets"] = self.episode_fact_targets[episode].astype(np.int32)
         return out
 
 
@@ -959,6 +964,49 @@ class MemoryV34Labels(DataTransformFn):
             memory_required_segment = bool(np.any(shifted_waiting & step_mask[: len(shifted_waiting)]))
             drawn = memory_required_segment and (np.random.random() < self.state_mask_prob)
             data["seq_state_masked"] = np.bool_(drawn)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryV4FactLabels(DataTransformFn):
+    """v4 (V4_PLAN.md) per-sample fact supervision. Runs AFTER MemoryV34Labels (it consumes
+    the v3.5 ``seq_write_mask``). Emits:
+
+      * "seq_fact_labels" [num_fact_slots] int32: the sidecar-derived per-slot target ids,
+        padded to the static slot budget with the trailing `unknown` class;
+      * "seq_fact_observable" [T, num_fact_slots] bool: slot populated AND the step is an
+        eligible E write step. v4-Base deliberately equates fact observability with E-write
+        eligibility -- both facts are visible exactly while the open bins are inspected.
+
+    Inference/legacy items (no ``seq_write_mask``) pass through with the episode field
+    dropped; a sequence item missing its episode fact targets fails loudly.
+    """
+
+    num_fact_slots: int
+    num_fact_targets: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        targets = data.pop("episode_fact_targets", None)
+        if "seq_write_mask" not in data:
+            return data
+        if targets is None:
+            raise ValueError("v4 sequence items require episode_fact_targets (is the sidecar configured?).")
+        targets = np.asarray(targets, dtype=np.int32)
+        if targets.ndim != 1 or targets.shape[0] > self.num_fact_slots:
+            raise ValueError(
+                f"episode_fact_targets must be [<= {self.num_fact_slots}] per episode, got shape {targets.shape}."
+            )
+        unknown = np.int32(self.num_fact_targets - 1)
+        if np.any((targets < 0) | (targets >= self.num_fact_targets)):
+            raise ValueError(f"episode_fact_targets out of range [0, {self.num_fact_targets}): {targets}.")
+        padded = np.full(self.num_fact_slots, unknown, dtype=np.int32)
+        padded[: targets.shape[0]] = targets
+        write_mask = np.asarray(data["seq_write_mask"], dtype=bool)
+        if write_mask.ndim != 1:
+            raise ValueError(f"seq_write_mask must be per-step [T], got shape {write_mask.shape}.")
+        populated = padded != unknown
+        data["seq_fact_labels"] = padded
+        data["seq_fact_observable"] = write_mask[:, None] & populated[None, :]
         return data
 
 

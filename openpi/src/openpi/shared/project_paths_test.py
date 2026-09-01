@@ -69,6 +69,28 @@ def test_project_path_rejects_symlink_escape(monkeypatch, tmp_path: pathlib.Path
         project_paths.project_path("escape/artifact.json")
 
 
+def test_project_path_accepts_only_the_sanctioned_shared_data_link(monkeypatch, tmp_path: pathlib.Path) -> None:
+    # v4 worktree affordance: a top-level "data" symlink into another checkout is sanctioned
+    # (SHARED_DATA_LINKS); any other symlink stays a rejected escape, and a nested symlink
+    # below the sanctioned link that jumps elsewhere still fails closed.
+    root = _project_fixture(tmp_path / "memory_project_v4")
+    primary = tmp_path / "memory_project" / "data"
+    primary.mkdir(parents=True)
+    (primary / "manifest.json").write_text("{}")
+    (root / "data").symlink_to(primary, target_is_directory=True)
+    monkeypatch.setenv(project_paths.MEMORY_PROJECT_ROOT_ENV, str(root))
+
+    resolved = project_paths.project_path("data/manifest.json")
+    assert resolved == primary / "manifest.json"
+    assert project_paths.project_relative_path(resolved) == pathlib.PurePosixPath("data/manifest.json")
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (primary / "nested_escape").symlink_to(foreign, target_is_directory=True)
+    with pytest.raises(project_paths.ProjectRootError, match="resolves outside memory_project"):
+        project_paths.project_path("data/nested_escape/artifact.json")
+
+
 def test_project_relative_path_round_trips_and_rejects_outside(monkeypatch, tmp_path: pathlib.Path) -> None:
     root = _project_fixture(tmp_path / "memory_project")
     monkeypatch.setenv(project_paths.MEMORY_PROJECT_ROOT_ENV, str(root))

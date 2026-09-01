@@ -100,6 +100,9 @@ class YamInputs(transforms.DataTransformFn):
             "seq_collection_id",
             "seq_object_id",
             "seq_memory_cell",
+            # v4 dual-bank fact supervision (V4_PLAN.md); absent for every v3.x config.
+            "seq_fact_labels",
+            "seq_fact_observable",
         ):
             if key in data:
                 inputs[key] = data[key]

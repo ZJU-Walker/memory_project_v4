@@ -177,6 +177,12 @@ class Observation(Generic[ArrayT]):
     seq_object_id: at.Int[ArrayT, "*sb"] | None = None
     seq_memory_cell: at.Int[ArrayT, "*sb"] | None = None
 
+    # v4 dual-bank fact supervision (V4_PLAN.md). Per-slot episode-constant target ids
+    # (index memory_fact_targets-1 = `unknown`) and the per-step observability mask (slot
+    # populated AND its fact visible at that frame). Absent for every v3.x data config.
+    seq_fact_labels: at.Int[ArrayT, "*sb f"] | None = None
+    seq_fact_observable: at.Bool[ArrayT, "*sb st f"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -224,6 +230,8 @@ class Observation(Generic[ArrayT]):
             seq_collection_id=data.get("seq_collection_id"),
             seq_object_id=data.get("seq_object_id"),
             seq_memory_cell=data.get("seq_memory_cell"),
+            seq_fact_labels=data.get("seq_fact_labels"),
+            seq_fact_observable=data.get("seq_fact_observable"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

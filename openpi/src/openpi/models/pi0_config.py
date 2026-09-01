@@ -219,6 +219,38 @@ class Pi0Config(_model.BaseModelConfig):
     memory_v35_calibration_id: str | None = None
     memory_v35_calibration_path: str | None = None
 
+    # --------------------------------------------------------------------------------------
+    # v4 (V4_PLAN.md): dual-bank visual + semantic memory. Default-off: with the flag False a
+    # v3.x config constructs the identical module tree and follows identical compute paths.
+    # --------------------------------------------------------------------------------------
+    memory_v4_dual_bank: bool = False
+    # Geometry of the semantic bank (independent TitansMemory instance; one bank can never
+    # overwrite the other). v4-Base deliberately mirrors the visual bank's geometry. The bank
+    # is driven purely through the key-space API: its W_K/W_V/W_Q/gate leaves exist for tree
+    # uniformity but are never called.
+    memory_semantic: _memory.MemoryConfig = dataclasses.field(default_factory=_memory.MemoryConfig)
+    # Static fact-slot budget (compile-time shape). The bin task populates 2 slots; unused
+    # slots are label-`unknown`/observable-nowhere in the data, never pruned from shapes.
+    memory_fact_slots: int = 8
+    # Fact-target vocabulary size. Index memory_fact_targets-1 is the mandatory `unknown`
+    # class: it is never written and never counts as an observable supervision target.
+    memory_fact_targets: int = 3
+    # A slot commits only on an eligible E step where the memory-blind fact head is at least
+    # this confident in a non-`unknown` target; otherwise the semantic bank decays only.
+    memory_fact_write_conf: float = 0.9
+    # CE weight of the memory-blind fact head on observable frames (the Stage-1 objective;
+    # also the write-content supervision once the bank is live).
+    memory_fact_loss_weight: float = 0.0
+    # CE weight of the read-side fact head: predict slot targets from the raw (pre-injection)
+    # semantic retrieval on decision steps — the semantic analogue of the v3.5 read-side loss.
+    memory_fact_read_loss_weight: float = 0.0
+    # Per-bank tanh_rms injection calibration for the semantic tokens. Separate c/tau because
+    # the semantic retrieval RMS is not the visual bank's; both are pinned by the same
+    # calibration program (per-bank measurement) before training is authorizable.
+    memory_sem_injection_c: float = 12.4
+    memory_sem_injection_tau: float = 0.02
+    memory_sem_injection_gate_init: float = 0.5
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -367,6 +399,48 @@ class Pi0Config(_model.BaseModelConfig):
                     raise ValueError("v3.5 requires nonzero write-side and read-side loss weights.")
                 if not self.memory_time_consistent_augmentation:
                     raise ValueError("v3.5 requires time-consistent sequence augmentation.")
+            if not self.memory_v4_dual_bank and (
+                self.memory_fact_loss_weight > 0 or self.memory_fact_read_loss_weight > 0
+            ):
+                raise ValueError("v4 fact losses require memory_v4_dual_bank=True.")
+            if self.memory_v4_dual_bank:
+                if not self.memory_v35_enabled:
+                    raise ValueError(
+                        "memory_v4_dual_bank builds on the v3.5 sequence semantics; set memory_v35_enabled=True."
+                    )
+                if (
+                    self.memory_semantic.write_rule != "delta_output"
+                    or self.memory_semantic.association_mode != "pooled_frame"
+                ):
+                    raise ValueError("the v4 semantic bank requires pooled-frame delta_output memory.")
+                if not self.memory_semantic.blank_initial_output:
+                    raise ValueError("the v4 semantic bank requires blank_initial_output=True for exact-zero reset.")
+                if self.memory_semantic.delta_rate != 1.0:
+                    raise ValueError("v4-Base freezes memory_semantic.delta_rate=1.0.")
+                # v4-Base runs both banks on one sparse clock so a skipped span collapses with a
+                # single per-bank factor of the same gap length. Compare in FP32 like the v3.5
+                # alpha pin (checkpoint identities record the fp32 runtime value).
+                if float(jnp.float32(self.memory_semantic.alpha_step)) != float(jnp.float32(self.memory.alpha_step)):
+                    raise ValueError("v4-Base requires memory_semantic.alpha_step == memory.alpha_step (fp32).")
+                if (
+                    self.memory_semantic.d_input != paligemma_config.width
+                    or self.memory_semantic.d_value != paligemma_config.width
+                ):
+                    raise ValueError(
+                        f"memory_semantic d_input/d_value must equal the PaliGemma width ({paligemma_config.width})."
+                    )
+                if self.memory_fact_slots < 1:
+                    raise ValueError("memory_fact_slots must be >= 1.")
+                if self.memory_fact_targets < 2:
+                    raise ValueError("memory_fact_targets must be >= 2 (>= one real target plus `unknown`).")
+                if not 0.0 < self.memory_fact_write_conf < 1.0:
+                    raise ValueError("memory_fact_write_conf must lie strictly inside (0, 1).")
+                if self.memory_fact_loss_weight < 0 or self.memory_fact_read_loss_weight < 0:
+                    raise ValueError("v4 fact-loss weights must be >= 0.")
+                if self.memory_sem_injection_c <= 0 or self.memory_sem_injection_tau <= 0:
+                    raise ValueError("semantic tanh_rms injection requires positive c and tau.")
+                if not -1.0 < self.memory_sem_injection_gate_init < 1.0:
+                    raise ValueError("memory_sem_injection_gate_init must lie strictly inside (-1, 1).")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -478,6 +552,22 @@ class Pi0Config(_model.BaseModelConfig):
                                 "seq_memory_cell": jax.ShapeDtypeStruct([batch_size], jnp.int32),
                             }
                             if self.memory_v35_enabled
+                            else {}
+                        ),
+                        **(
+                            {
+                                # v4 fact supervision: per-slot episode-constant target ids and
+                                # the per-step observability mask (slot populated AND its fact
+                                # visible at this frame). Unpopulated slots carry the `unknown`
+                                # label and are observable nowhere.
+                                "seq_fact_labels": jax.ShapeDtypeStruct(
+                                    [batch_size, self.memory_fact_slots], jnp.int32
+                                ),
+                                "seq_fact_observable": jax.ShapeDtypeStruct(
+                                    [*lead, self.memory_fact_slots], bool
+                                ),
+                            }
+                            if self.memory_v4_dual_bank
                             else {}
                         ),
                     }

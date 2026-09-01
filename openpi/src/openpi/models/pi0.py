@@ -583,6 +583,69 @@ class Pi0(_model.BaseModel):
                         qk_norm=config.memory_qk_norm,
                         rngs=rngs,
                     )
+            # ---- v4 (V4_PLAN.md): independent semantic bank + memory-blind fact head ----
+            self.memory_v4_dual_bank = config.memory_v4_dual_bank
+            if config.memory_v4_dual_bank:
+                self.memory_fact_slots = config.memory_fact_slots
+                self.memory_fact_targets = config.memory_fact_targets
+                self.memory_fact_write_conf = config.memory_fact_write_conf
+                self.memory_fact_loss_weight = config.memory_fact_loss_weight
+                self.memory_fact_read_loss_weight = config.memory_fact_read_loss_weight
+                self.memory_sem_injection_c = config.memory_sem_injection_c
+                self.memory_sem_injection_tau = config.memory_sem_injection_tau
+                # Independent fast-memory instance: one bank can never overwrite the other. It
+                # is driven purely through the key-space API (delta_write_kv_multi/read_key);
+                # its W_K/W_V/W_Q/gate leaves exist only for tree uniformity and are never
+                # called.
+                self.memory_semantic = _memory.TitansMemory(config.memory_semantic, rngs=rngs)
+                # Learned key-space addresses, one per fact slot (L2-normalized at use). Fixed
+                # frame-invariant addresses make the semantic bank an F-slot associative map
+                # whose cross-slot interference is measurable in closed form, and make the
+                # read query instruction-independent by construction.
+                self.fact_keys = nnx.Param(
+                    jax.random.normal(
+                        rngs.params(),
+                        (config.memory_fact_slots, config.memory_semantic.d_key),
+                        dtype=jnp.float32,
+                    )
+                )
+                # Memory-blind fact head: F learned queries cross-attend the layer-8
+                # top-camera states. h8 precedes injection at the block-8 boundary, so the
+                # draft's no-teacher-forcing/no-echo rules hold structurally, not by training
+                # discipline.
+                self.fact_compressor = MemoryQueryCompressor(
+                    num_queries=config.memory_fact_slots,
+                    width=paligemma_config.width,
+                    num_heads=config.memory_query_heads,
+                    compute_dtype=jnp.dtype(config.dtype),
+                    qk_norm=config.memory_qk_norm,
+                    rngs=rngs,
+                )
+                self.fact_logit_head = nnx.Linear(paligemma_config.width, config.memory_fact_targets, rngs=rngs)
+                # Written value = L2Norm(softmax(logits) @ fact_value_embed): the model's OWN
+                # predicted distribution embedded -- never a label embedding. Unit-std init
+                # keeps distinct targets separated after normalization.
+                self.fact_value_embed = nnx.Param(
+                    jax.random.normal(
+                        rngs.params(),
+                        (config.memory_fact_targets, config.memory_semantic.d_value),
+                        dtype=jnp.float32,
+                    )
+                )
+                # Read-side fact head on the raw (pre-injection) semantic retrieval.
+                self.memory_fact_read_head = nnx.Linear(
+                    config.memory_semantic.d_value, config.memory_fact_targets, rngs=rngs
+                )
+                # Per-bank tanh_rms injection gate + zero-init slot embeddings. Zero-init is
+                # load-bearing (v36 step-0 lesson): RMSNorm renormalizes ANY nonzero slot
+                # vector to unit RMS, breaking the step-0 transparency bound.
+                sem_gate_w = jnp.arctanh(jnp.asarray(config.memory_sem_injection_gate_init, dtype=jnp.float32))
+                self.memory_sem_inject_w = nnx.Param(
+                    jnp.full((config.memory_semantic.d_value,), sem_gate_w, dtype=jnp.float32)
+                )
+                self.memory_sem_slot_embedding = nnx.Param(
+                    jnp.zeros((config.memory_fact_slots, config.memory_semantic.d_value), dtype=jnp.float32)
+                )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -623,6 +686,14 @@ class Pi0(_model.BaseModel):
         if mask.shape[-1] > capacity:
             raise ValueError(f"attention mask width {mask.shape[-1]} exceeds cache capacity {capacity}.")
         return jnp.pad(mask, ((0, 0), (0, 0), (0, capacity - mask.shape[-1])))
+
+    @property
+    def _memory_token_total(self) -> int:
+        """Layout width of the injected memory block: the 16 visual slots plus, under v4, the
+        semantic fact slots. Equals memory_query_tokens exactly for every v3.x config, so all
+        v3 position/mask geometry is bit-identical."""
+        extra = self.memory_fact_slots if getattr(self, "memory_v4_dual_bank", False) else 0
+        return self.memory_query_tokens + extra
 
     def _v32_content_gate(self) -> at.Array:
         """The effective per-channel content scale of the memory injection: the zero-init gate
@@ -705,6 +776,143 @@ class Pi0(_model.BaseModel):
             "v35_oracle_actual_rms": actual_rms.astype(jnp.float32),
         }
 
+    # ------------------------------------------------------------------------------------------
+    # v4 (V4_PLAN.md): semantic-bank surface. The fact head reads the layer-8 states, which
+    # precede both banks' injections at the block-8 boundary, so every method below is
+    # memory-blind by construction; the causal ladder (content -> commit -> retain -> read ->
+    # use) hits these exact boundaries.
+    # ------------------------------------------------------------------------------------------
+
+    def v4_fact_keys(self) -> at.Float[at.Array, "f dk"]:
+        """L2-normalized FP32 key-space addresses of the fact slots."""
+        return _memory.l2_normalize(self.fact_keys.value.astype(jnp.float32))
+
+    @at.typecheck
+    def v4_fact_logits(self, h8_top: at.Float[at.Array, "b n emb"]) -> at.Float[at.Array, "b f t"]:
+        """Memory-blind per-slot fact logits from the layer-8 top-camera hidden states."""
+        source_valid = self._v32_top_patch_valid(h8_top.shape[1])
+        slots = self.fact_compressor(h8_top.astype(jnp.float32), source_valid=source_valid)
+        return self.fact_logit_head(slots.astype(jnp.float32)).astype(jnp.float32)
+
+    @at.typecheck
+    def v4_fact_write_intent(self, fact_logits: at.Float[at.Array, "b f t"]) -> dict[str, at.Array]:
+        """Per-slot write content and eligibility from the memory-blind logits.
+
+        The written value is ``L2Norm(softmax(logits) @ fact_value_embed)`` -- the model's own
+        predicted distribution embedded, never the training label (draft rule 6.1). A slot is
+        write-eligible when its argmax is a real (non-``unknown``) target at confidence >=
+        ``memory_fact_write_conf``; the sequence caller ANDs this with the step's write mask.
+        ``unknown`` is the trailing class and is never written.
+        """
+        logits32 = fact_logits.astype(jnp.float32)
+        probs = jax.nn.softmax(logits32, axis=-1)
+        values = _memory.l2_normalize(
+            jnp.einsum(
+                "bft,td->bfd",
+                probs,
+                self.fact_value_embed.value.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
+        )
+        confidence = jnp.max(probs, axis=-1)
+        predicted = jnp.argmax(logits32, axis=-1).astype(jnp.int32)
+        unknown = self.memory_fact_targets - 1
+        eligible = (predicted != unknown) & (confidence >= self.memory_fact_write_conf)
+        keys = jnp.broadcast_to(self.v4_fact_keys()[None], values.shape[:2] + (self.fact_keys.value.shape[-1],))
+        return {
+            "keys": keys.astype(jnp.float32),
+            "values": values.astype(jnp.float32),
+            "probs": probs.astype(jnp.float32),
+            "confidence": confidence.astype(jnp.float32),
+            "predicted": predicted,
+            "write_eligible": eligible,
+        }
+
+    @at.typecheck
+    def v4_semantic_write(
+        self,
+        state: _memory.MemoryState,
+        fact_logits: at.Float[at.Array, "b f t"],
+        write_mask: at.Bool[at.Array, " b"],
+    ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
+        """One semantic-bank transition: decay once, commit the eligible confident slots.
+
+        Like every delta transition this must run AFTER the step's reads. A sample with
+        ``write_mask`` False (or no eligible slot) takes exactly one analytic decay step, so
+        the shared sparse clock stays collapsible across write-free gaps.
+        """
+        intent = self.v4_fact_write_intent(fact_logits)
+        commit = intent["write_eligible"] & write_mask[:, None]
+        new_state, aux = self.memory_semantic.delta_write_kv_multi(
+            state, intent["keys"], intent["values"], commit
+        )
+        return new_state, {
+            **aux,
+            "fact_probs": intent["probs"],
+            "fact_confidence": intent["confidence"],
+            "fact_predicted": intent["predicted"],
+            "fact_write_eligible": intent["write_eligible"],
+        }
+
+    @at.typecheck
+    def v4_semantic_read(self, state: _memory.MemoryState) -> at.Float[at.Array, "b f dv"]:
+        """Raw FP32 semantic retrieval at the fixed slot addresses (pre-injection contract)."""
+        batch = next(iter(state.fast_weights.values())).shape[0]
+        keys = jnp.broadcast_to(self.v4_fact_keys()[None], (batch, *self.fact_keys.value.shape))
+        return self.memory_semantic.read_key(state, keys)
+
+    @at.typecheck
+    def v4_fact_read_logits(self, retrieved: at.Float[at.Array, "b f dv"]) -> at.Float[at.Array, "b f t"]:
+        """Read-side per-slot fact logits from the raw (pre-injection) semantic retrieval."""
+        return self.memory_fact_read_head(retrieved.astype(jnp.float32)).astype(jnp.float32)
+
+    def _v4_inject_semantic(self, retrieved: at.Array) -> at.Array:
+        """The semantic bank's tanh_rms injection (FP32), with its own gate and calibration.
+
+        Same non-amplifying max(rms, tau) floor and eps-inside-sqrt construction as
+        :meth:`_v32_inject_memory`: a fresh bank retrieves exactly zero and must inject
+        exactly zero with a finite backward.
+        """
+        retrieved32 = retrieved.astype(jnp.float32)
+        rms = jnp.sqrt(jnp.mean(jnp.square(retrieved32), axis=-1, keepdims=True) + 1e-12)
+        normed = retrieved32 * (self.memory_sem_injection_c / jnp.maximum(rms, self.memory_sem_injection_tau))
+        return jnp.tanh(self.memory_sem_inject_w.value) * normed
+
+    @at.typecheck
+    def v4_fact_probe_step(self, observation: _model.Observation) -> dict[str, at.Array]:
+        """Single-frame, memory-free fact-head evaluation (the Stage-1 battery boundary).
+
+        Builds the standard prefix, runs the layer-8 interface against FRESH banks (zero
+        retrieval, exactly-zero injection by the blank-state contract), and returns the
+        memory-blind fact outputs. No memory state is threaded or returned: Stage-1 leak
+        probes must see exactly what a memory-less model sees.
+        """
+        if not getattr(self, "memory_v4_dual_bank", False):
+            raise ValueError("v4_fact_probe_step requires a memory_v4_dual_bank model.")
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        num_img = prefix_mask.shape[1] - self.max_token_len
+        top_tokens = num_img // len(preprocessed.images)
+        batch = prefix_mask.shape[0]
+        prepared = self._v32_prepare_memory_interface(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            self.memory.init_state(batch),
+            top_token_count=top_tokens,
+            state_token_mask=preprocessed.token_state_mask,
+            semantic_state=self.memory_semantic.init_state(batch),
+        )
+        fact_logits = self.v4_fact_logits(prepared["h8_top"])
+        intent = self.v4_fact_write_intent(fact_logits)
+        return {
+            "fact_logits": fact_logits,
+            "fact_probs": intent["probs"],
+            "fact_confidence": intent["confidence"],
+            "fact_predicted": intent["predicted"],
+            "h8_top": prepared["h8_top"],
+        }
+
     def _v32_top_patch_valid(self, top_token_count: int) -> at.Array | None:
         """The static letterbox validity mask as a device array, or None when not configured."""
         patch_valid = getattr(self, "top_patch_valid", None)
@@ -773,6 +981,7 @@ class Pi0(_model.BaseModel):
         state_token_mask: at.Array | None = None,
         v35_oracle_direction: at.Float[at.Array, "b d"] | None = None,
         v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None = None,
+        semantic_state: _memory.MemoryState | None = None,
     ) -> dict[str, at.Array | _gemma.KVCache]:
         """Run only blocks 0..memory_layer and materialize the dual-query interface.
 
@@ -781,10 +990,20 @@ class Pi0(_model.BaseModel):
         `state_token_mask` marks the state-digit positions within the tokenized prompt; it is
         REQUIRED when the conditioner context is 'instruction_only' (v3.4 plan 5.9) so that a
         forgotten call site fails loudly instead of silently running a different writer.
+        `semantic_state` is the v4 semantic bank and is REQUIRED (same fail-loudly contract)
+        whenever the model is dual-bank: its F retrieved fact slots are appended after the 16
+        visual slots with their own gate, calibration, and slot embeddings.
         """
 
         if self.memory_architecture != "v32_layer8_dual_query":
             raise ValueError("the split layer-8 prefix is only defined for v3.2.")
+        v4_on = getattr(self, "memory_v4_dual_bank", False)
+        if v4_on and semantic_state is None:
+            raise ValueError(
+                "memory_v4_dual_bank models require the semantic bank state at every interface call site."
+            )
+        if not v4_on and semantic_state is not None:
+            raise ValueError("semantic_state was provided but this model has no semantic bank.")
         oracle_active = v35_oracle_direction is not None or v35_oracle_injected_rms is not None
         if (v35_oracle_direction is None) != (v35_oracle_injected_rms is None):
             raise ValueError("v35_oracle_direction and v35_oracle_injected_rms must be provided together.")
@@ -793,7 +1012,7 @@ class Pi0(_model.BaseModel):
         if oracle_active and (zero_read or gate_value is not None):
             raise ValueError("v3.5 oracle injection cannot be combined with zero_read or gate_value.")
         batch, prefix_len = prefix_mask.shape
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         capacity = prefix_len + mem_len + self.causal_token_len
         depth = self.PaliGemma.llm.module.configs[0].depth
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -843,10 +1062,12 @@ class Pi0(_model.BaseModel):
         if zero_read:
             retrieved = jnp.zeros_like(retrieved)
         if oracle_active:
+            # The oracle pins only the 16 VISUAL slots; a v4 semantic block, when present,
+            # keeps its normal retrieval below.
             injected_content, oracle_aux = self._v35_oracle_injected_content(
                 v35_oracle_direction,
                 v35_oracle_injected_rms,
-                num_slots=mem_len,
+                num_slots=self.memory_query_tokens,
             )
         else:
             injected_content = self._v32_inject_memory(retrieved, gate_value).astype(jnp.float32)
@@ -870,7 +1091,29 @@ class Pi0(_model.BaseModel):
             memory_content = memory_content + slot_embedding.value[None]
         memory_tokens = memory_content.astype(prefix_tokens.dtype)
 
+        sem_outputs: dict[str, at.Array] = {}
+        if v4_on:
+            # v4 semantic block: F fact slots appended after the visual slots. Same
+            # zero_read semantics (content ablation ablates BOTH banks' content; per-bank
+            # ablations are dedicated diagnostics), same pre/post-cast RMS bookkeeping, and
+            # bank-private zero-init slot embeddings added after the RMS measurement.
+            sem_retrieved = self.v4_semantic_read(semantic_state)
+            if zero_read:
+                sem_retrieved = jnp.zeros_like(sem_retrieved)
+            sem_injected = self._v4_inject_semantic(sem_retrieved).astype(jnp.float32)
+            sem_pre_cast_rms = jnp.sqrt(jnp.mean(jnp.square(sem_injected), axis=(1, 2)))
+            sem_post_cast = sem_injected.astype(prefix_tokens.dtype)
+            sem_post_cast_rms = jnp.sqrt(jnp.mean(jnp.square(sem_post_cast.astype(jnp.float32)), axis=(1, 2)))
+            sem_content = sem_injected + self.memory_sem_slot_embedding.value[None]
+            memory_tokens = jnp.concatenate([memory_tokens, sem_content.astype(prefix_tokens.dtype)], axis=1)
+            sem_outputs = {
+                "sem_retrieved": sem_retrieved,
+                "sem_injected_pre_cast_rms": sem_pre_cast_rms.astype(jnp.float32),
+                "sem_injected_post_cast_rms": sem_post_cast_rms.astype(jnp.float32),
+            }
+
         return {
+            **sem_outputs,
             "cache": cache,
             "h8_all": h8_all,
             "h8_top": h8_top,
@@ -918,8 +1161,9 @@ class Pi0(_model.BaseModel):
         state_token_mask: at.Array | None = None,
         v35_oracle_direction: at.Float[at.Array, "b d"] | None = None,
         v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None = None,
+        semantic_state: _memory.MemoryState | None = None,
     ) -> dict[str, at.Array | _gemma.KVCache]:
-        """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once.
+        """Run blocks 0..8, form q/z, inject the memory reads, then run blocks 9..17 once.
 
         `gate_value` overrides the learned content gate (diagnostics only, e.g. probing the
         gradient pathway while the zero-init gate is still closed); None uses the parameter.
@@ -936,9 +1180,10 @@ class Pi0(_model.BaseModel):
             state_token_mask=state_token_mask,
             v35_oracle_direction=v35_oracle_direction,
             v35_oracle_injected_rms=v35_oracle_injected_rms,
+            semantic_state=semantic_state,
         )
         batch, prefix_len = prefix_mask.shape
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         capacity = prefix_len + mem_len + self.causal_token_len
         depth = self.PaliGemma.llm.module.configs[0].depth
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -970,7 +1215,7 @@ class Pi0(_model.BaseModel):
 
     def _v32_causal_mask(self, prefix_mask: at.Array, causal_mask: at.Array) -> at.Array:
         batch, causal_len = causal_mask.shape
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         causal_self = jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))[None] & causal_mask[:, None, :]
         prefix_rows = einops.repeat(prefix_mask, "b p -> b c p", c=causal_len)
         early = jnp.concatenate(
@@ -981,7 +1226,7 @@ class Pi0(_model.BaseModel):
 
     def _v32_step_mask(self, prefix_mask: at.Array, generated_count: at.Array) -> at.Array:
         batch = prefix_mask.shape[0]
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         gen_valid = jnp.broadcast_to(
             jnp.arange(self.causal_token_len)[None, :] < generated_count, (batch, self.causal_token_len)
         )
@@ -993,7 +1238,7 @@ class Pi0(_model.BaseModel):
         self, prefix_mask: at.Array, causal_mask: at.Array, suffix_mask: at.Array, suffix_ar: at.Array
     ) -> at.Array:
         batch = prefix_mask.shape[0]
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         early_view = jnp.concatenate([prefix_mask, jnp.zeros((batch, mem_len), dtype=bool), causal_mask], axis=1)
         late_view = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool), causal_mask], axis=1)
         suffix_self = make_attn_mask(suffix_mask, suffix_ar)
@@ -2254,7 +2499,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
         prefix_len = prefix_mask.shape[1]
         num_img = prefix_len - self.max_token_len
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         prepared = self._v32_prepare_memory_prefix(
             prefix_tokens,
             prefix_mask,
@@ -2481,7 +2726,7 @@ class Pi0(_model.BaseModel):
             top_token_count=top_tokens,
             state_token_mask=preprocessed.token_state_mask,
         )
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
 
         def memory_suffix_mask(suffix_mask, suffix_ar):
             return self._v32_suffix_mask(prefix_mask, causal_mask & ~causal_fast, suffix_mask, suffix_ar)
@@ -2881,7 +3126,7 @@ class Pi0(_model.BaseModel):
             raise ValueError("the endpoint gradient probe needs a sequence batch (seq_step_mask present).")
         b, t = observation.seq_step_mask.shape
         causal_len = observation.tokenized_causal.shape[-1]
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         gate = (
             None if gate_override is None else jnp.full((self.memory.config.d_value,), gate_override, dtype=jnp.float32)
         )
@@ -3214,7 +3459,7 @@ class Pi0(_model.BaseModel):
         prefix_len = prefix_mask.shape[1]
         num_img = prefix_len - self.max_token_len
         top_tokens = num_img // len(preprocessed.images)
-        mem_len = self.memory_query_tokens
+        mem_len = self._memory_token_total
         gen_base = prefix_len + mem_len
         prepared = self._v32_prepare_memory_prefix(
             prefix_tokens,
@@ -3482,6 +3727,12 @@ class Pi0(_model.BaseModel):
         per-query hidden-key cosine/beta, cancellation, and anchor-predicted read residuals.
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if getattr(self, "memory_v4_dual_bank", False):
+            # Dual-bank inference (per-bank state threading, reset/donor-swap controls) lands
+            # with Stage 2. Until then, the trainable path is _compute_sequence_loss_v32 and
+            # the Stage-1 battery uses v4_fact_probe_step; failing here beats silently
+            # sampling with an absent semantic bank.
+            raise NotImplementedError("sample_with_memory does not support memory_v4_dual_bank yet (V4_PLAN.md §5).")
         assert max_decode_steps <= self.causal_token_len
         if write_mode is None:
             write_mode = "normal" if allow_write else "frozen"
@@ -3846,6 +4097,12 @@ class Pi0(_model.BaseModel):
             missing = [name for name in required if getattr(observation, name, None) is None]
             if missing:
                 raise ValueError(f"v3.5 sequence training is missing required observation fields: {missing}.")
+        v4_on = getattr(self, "memory_v4_dual_bank", False)
+        if v4_on:
+            if not v35_on:
+                raise ValueError("v4 dual-bank sequence training requires the v3.5 sequence semantics.")
+            if observation.seq_fact_labels is None or observation.seq_fact_observable is None:
+                raise ValueError("v4 sequence training requires seq_fact_labels and seq_fact_observable.")
         mask_state = (
             getattr(self, "memory_state_mask_prob", 0.0) > 0
             and observation.seq_state_masked is not None
@@ -3892,6 +4149,8 @@ class Pi0(_model.BaseModel):
             xs["read_credit_reachable"] = step_first(observation.seq_read_credit_reachable)
             xs["decay_gap_before"] = step_first(observation.seq_decay_gap_before)
             xs["use_pressure_mask"] = step_first(observation.seq_use_pressure_mask)
+        if v4_on:
+            xs["fact_observable"] = step_first(observation.seq_fact_observable)
 
         # Per-sample (step-invariant) inputs are closed over rather than scanned.
         segment_masked = observation.seq_state_masked if mask_state else None
@@ -3899,6 +4158,16 @@ class Pi0(_model.BaseModel):
             side_label = observation.seq_side_label
             side_ok = (side_label >= 0) & (side_label < 2)
             safe_side = jnp.clip(side_label, 0, 1)
+        if v4_on:
+            fact_targets = self.memory_fact_targets
+            unknown_class = fact_targets - 1
+            raw_fact_labels = observation.seq_fact_labels
+            fact_labels = jnp.clip(raw_fact_labels, 0, fact_targets - 1)
+            # A "real" slot carries a non-`unknown` in-vocabulary target; everything else is
+            # unpopulated and only ever supervised toward abstention.
+            fact_label_real = (raw_fact_labels >= 0) & (raw_fact_labels < fact_targets) & (
+                fact_labels != unknown_class
+            )
         if aux_on:
             aux_classes = self.memory_aux_head.out_features
             # Frame-invariant auxiliary queries (plan 5.1): L2-normalized bank, broadcast per
@@ -3966,15 +4235,26 @@ class Pi0(_model.BaseModel):
                 }
 
         def step(carry, x):
-            if v35_on:
+            if v4_on:
+                state, sem_state, sem_written, runtime_state_valid, runtime_credit_reachable = carry
+            elif v35_on:
                 state, runtime_state_valid, runtime_credit_reachable = carry
             else:
                 state = carry
             boundary_active = x["boundary"] & x["step_valid"] if v35_on else x["boundary"]
-            state = jax.tree.map(
-                lambda s: jnp.where(boundary_active.reshape((b,) + (1,) * (s.ndim - 1)), jax.lax.stop_gradient(s), s),
-                state,
-            )
+
+            def cut_at_boundary(tree):
+                return jax.tree.map(
+                    lambda s: jnp.where(
+                        boundary_active.reshape((b,) + (1,) * (s.ndim - 1)), jax.lax.stop_gradient(s), s
+                    ),
+                    tree,
+                )
+
+            state = cut_at_boundary(state)
+            if v4_on:
+                # TBPTT cuts apply to BOTH banks' recurrent states; content always flows.
+                sem_state = cut_at_boundary(sem_state)
             if v35_on:
                 runtime_credit_reachable = jnp.where(
                     boundary_active, jnp.zeros_like(runtime_credit_reachable), runtime_credit_reachable
@@ -3994,6 +4274,16 @@ class Pi0(_model.BaseModel):
                     gap_state,
                     state,
                 )
+                if v4_on:
+                    # Shared sparse clock: the semantic bank collapses the same skipped span.
+                    sem_gap_state, _ = self.memory_semantic.analytic_decay(sem_state, safe_gap)
+                    sem_state = jax.tree.map(
+                        lambda decayed, original: jnp.where(
+                            gap_apply.reshape((b,) + (1,) * (decayed.ndim - 1)), decayed, original
+                        ),
+                        sem_gap_state,
+                        sem_state,
+                    )
             obs_k = _model.Observation(
                 images=x["images"],
                 image_masks={k: jnp.ones(b, dtype=bool) for k in x["images"]},
@@ -4005,7 +4295,7 @@ class Pi0(_model.BaseModel):
             num_img = prefix_mask.shape[1] - self.max_token_len
             top_tokens = num_img // len(x["images"])
             prefix_len = prefix_mask.shape[1]
-            mem_len = self.memory_query_tokens
+            mem_len = self._memory_token_total
             state_token_mask = x.get("token_state_mask")
             if mask_state:
                 masked_prefix_tokens = self._v32_apply_state_null(
@@ -4020,6 +4310,7 @@ class Pi0(_model.BaseModel):
                 state,
                 top_token_count=top_tokens,
                 state_token_mask=state_token_mask,
+                semantic_state=sem_state if v4_on else None,
             )
             if dual_view:
                 # Plan 5.2 gold-standard variant: memory-state evolution from the FULL view
@@ -4032,10 +4323,17 @@ class Pi0(_model.BaseModel):
                     state,
                     top_token_count=top_tokens,
                     state_token_mask=state_token_mask,
+                    semantic_state=sem_state if v4_on else None,
                 )
                 write_tokens = full_prepared["write_tokens"]
             else:
                 write_tokens = prepared["write_tokens"]
+            if v4_on:
+                # Memory-blind fact head. The CE (task) view follows the masked forward like
+                # every other loss; the WRITE content follows the memory-state-evolution view
+                # (the full view under dual_view), mirroring the write_tokens choice above.
+                fact_logits_task = self.v4_fact_logits(prepared["h8_top"])
+                write_fact_logits = self.v4_fact_logits(full_prepared["h8_top"]) if dual_view else fact_logits_task
             kv_cache = prepared["cache"]
             final_prefix = prepared["final_prefix"]
             read_queries = prepared["read_queries"]
@@ -4101,6 +4399,22 @@ class Pi0(_model.BaseModel):
                 commit_success = write_requested & write_aux["commit_applied"]
                 next_runtime_state_valid = runtime_state_valid | commit_success
                 next_runtime_credit_reachable = runtime_credit_reachable | commit_success
+                if v4_on:
+                    # Semantic transition: decay once, commit the confident eligible slots on
+                    # E steps (v4_semantic_write ANDs eligibility with write_requested).
+                    # Invalid/padded steps keep the exact previous state, like the visual bank.
+                    sem_write_state, sem_aux = self.v4_semantic_write(
+                        sem_state, write_fact_logits, write_requested
+                    )
+                    sem_state = jax.tree.map(
+                        lambda new, old: jnp.where(
+                            transition_valid.reshape((b,) + (1,) * (new.ndim - 1)), new, old
+                        ),
+                        sem_write_state,
+                        sem_state,
+                    )
+                    sem_commit = sem_aux["commit_applied"] & transition_valid[:, None]
+                    next_sem_written = sem_written | sem_commit
 
                 # D losses are legal only when both the sampler and the actual recurrent
                 # state agree that a successful E commit precedes this read. Reachability is
@@ -4200,6 +4514,62 @@ class Pi0(_model.BaseModel):
                     }
                 )
 
+                if v4_on:
+                    transition_validf = transition_valid.astype(jnp.float32)
+                    # Write-side (Stage-1) fact CE: the true target on observable frames; the
+                    # mandatory `unknown` abstention on decision frames, where a memory-blind
+                    # head that still "knows" is by definition leaking through pose/state.
+                    observable = x["fact_observable"] & transition_valid[:, None]
+                    supervise_true = observable & fact_label_real
+                    supervise_unknown = (x["decision_mask"] & transition_valid)[:, None] & ~observable
+                    fact_target = jnp.where(supervise_true, fact_labels, unknown_class)
+                    fact_active = (supervise_true | supervise_unknown).astype(jnp.float32)
+                    fact_logp = jax.nn.log_softmax(fact_logits_task, axis=-1)
+                    fact_ce = -jnp.take_along_axis(fact_logp, fact_target[..., None], axis=-1)[..., 0]
+                    fact_correct = (jnp.argmax(fact_logits_task, axis=-1) == fact_target).astype(jnp.float32)
+
+                    # Read-side fact CE: decode each written slot's true target from the raw
+                    # pre-injection retrieval on decision steps. Per-slot runtime gating
+                    # mirrors the v3.5 read_active semantics (a slot must have committed).
+                    fact_read_logits = self.v4_fact_read_logits(prepared["sem_retrieved"])
+                    sem_read_active = (
+                        (x["decision_mask"] & transition_valid)[:, None] & sem_written & fact_label_real
+                    ).astype(jnp.float32)
+                    read_logp = jax.nn.log_softmax(fact_read_logits, axis=-1)
+                    fact_read_ce = -jnp.take_along_axis(read_logp, fact_labels[..., None], axis=-1)[..., 0]
+                    fact_read_correct = (jnp.argmax(fact_read_logits, axis=-1) == fact_labels).astype(jnp.float32)
+
+                    sem_requested = sem_aux["commit_requested"]
+                    outputs.update(
+                        {
+                            "v4_fact_ce": fact_ce * fact_active,
+                            "v4_fact_correct": fact_correct * fact_active,
+                            "v4_fact_active": fact_active,
+                            "v4_fact_target": fact_target,
+                            "v4_fact_read_ce": fact_read_ce * sem_read_active,
+                            "v4_fact_read_correct": fact_read_correct * sem_read_active,
+                            "v4_fact_read_active": sem_read_active,
+                            "v4_sem_commit": sem_commit.astype(jnp.float32),
+                            "v4_sem_write_eligible": (sem_requested & transition_valid[:, None]).astype(
+                                jnp.float32
+                            ),
+                            "v4_sem_degenerate": (
+                                sem_requested & ~sem_aux["commit_applied"] & transition_valid[:, None]
+                            ).astype(jnp.float32),
+                            "v4_sem_final_residual": jnp.where(
+                                sem_commit, jax.lax.stop_gradient(sem_aux["final_read_residual_norm"]), 0.0
+                            ),
+                            "v4_sem_raw_read_rms": jnp.sqrt(
+                                jnp.mean(jnp.square(prepared["sem_retrieved"].astype(jnp.float32)), axis=(1, 2))
+                            )
+                            * transition_validf,
+                            "v4_sem_injected_pre_cast_rms": prepared["sem_injected_pre_cast_rms"]
+                            * transition_validf,
+                            "v4_sem_injected_post_cast_rms": prepared["sem_injected_post_cast_rms"]
+                            * transition_validf,
+                        }
+                    )
+
             if quiz:
                 probe_read = self.memory.read(state, read_queries)
                 pooled = jnp.mean(self.memory_gate.value * probe_read, axis=1)
@@ -4258,14 +4628,31 @@ class Pi0(_model.BaseModel):
                     ) * active
                     outputs[f"{name}_count"] = active
 
+            if v4_on:
+                return (
+                    state,
+                    sem_state,
+                    next_sem_written,
+                    next_runtime_state_valid,
+                    next_runtime_credit_reachable,
+                ), outputs
             if v35_on:
                 return (state, next_runtime_state_valid, next_runtime_credit_reachable), outputs
             return state, outputs
 
         initial_state = self.memory.init_state(b)
-        initial_carry = (
-            (initial_state, jnp.zeros((b,), dtype=bool), jnp.zeros((b,), dtype=bool)) if v35_on else initial_state
-        )
+        if v4_on:
+            initial_carry = (
+                initial_state,
+                self.memory_semantic.init_state(b),
+                jnp.zeros((b, self.memory_fact_slots), dtype=bool),
+                jnp.zeros((b,), dtype=bool),
+                jnp.zeros((b,), dtype=bool),
+            )
+        elif v35_on:
+            initial_carry = (initial_state, jnp.zeros((b,), dtype=bool), jnp.zeros((b,), dtype=bool))
+        else:
+            initial_carry = initial_state
         _, ys = jax.lax.scan(jax.checkpoint(step, prevent_cse=False), initial_carry, xs)
         write_valid_count = jnp.sum(ys["valid"], axis=0)
         n_valid = jnp.clip(write_valid_count, 1)
@@ -4364,6 +4751,30 @@ class Pi0(_model.BaseModel):
                     "v35_injected_pre_cast_rms_sum": jnp.sum(ys["v35_injected_pre_cast_rms"]),
                     "v35_injected_post_cast_rms_sum": jnp.sum(ys["v35_injected_post_cast_rms"]),
                     "v35_transition_count": transition_count,
+                }
+            )
+        if v4_on:
+            # Per-target-class sums for a class-balanced macro fact CE in train.py (the
+            # `unknown` abstention rows vastly outnumber the observable rows; a plain mean
+            # would drown the real targets -- the aux-CE lesson).
+            target_onehot = jax.nn.one_hot(ys["v4_fact_target"], fact_targets, dtype=jnp.float32)
+            weighted = target_onehot * ys["v4_fact_active"][..., None]
+            losses.update(
+                {
+                    "v4_fact_ce_class_sum": jnp.sum(weighted * ys["v4_fact_ce"][..., None], axis=(0, 1, 2)),
+                    "v4_fact_count_class": jnp.sum(weighted, axis=(0, 1, 2)),
+                    "v4_fact_correct_class": jnp.sum(weighted * ys["v4_fact_correct"][..., None], axis=(0, 1, 2)),
+                    "v4_fact_read_ce_sum": jnp.sum(ys["v4_fact_read_ce"]),
+                    "v4_fact_read_count": jnp.sum(ys["v4_fact_read_active"]),
+                    "v4_fact_read_correct": jnp.sum(ys["v4_fact_read_correct"]),
+                    "v4_sem_commit_count": jnp.sum(ys["v4_sem_commit"]),
+                    "v4_sem_write_eligible_count": jnp.sum(ys["v4_sem_write_eligible"]),
+                    "v4_sem_degenerate_count": jnp.sum(ys["v4_sem_degenerate"]),
+                    "v4_sem_final_residual_sum": jnp.sum(ys["v4_sem_final_residual"]),
+                    "v4_sem_final_residual_max": jnp.max(ys["v4_sem_final_residual"]),
+                    "v4_sem_raw_read_rms_sum": jnp.sum(ys["v4_sem_raw_read_rms"]),
+                    "v4_sem_injected_pre_cast_rms_sum": jnp.sum(ys["v4_sem_injected_pre_cast_rms"]),
+                    "v4_sem_injected_post_cast_rms_sum": jnp.sum(ys["v4_sem_injected_post_cast_rms"]),
                 }
             )
         return losses

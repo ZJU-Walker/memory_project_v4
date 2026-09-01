@@ -27,6 +27,7 @@ class _TinyImageEncoder(nnx.Module):
 
 
 class _TinyV32(nnx.Module):
+    _memory_token_total = pi0.Pi0._memory_token_total  # noqa: SLF001
     embed_prefix = pi0.Pi0.embed_prefix
     embed_suffix = pi0.Pi0.embed_suffix
     sample_with_memory = pi0.Pi0.sample_with_memory

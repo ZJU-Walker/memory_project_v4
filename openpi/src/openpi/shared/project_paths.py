@@ -30,6 +30,13 @@ JAX_CACHE_DIR = CACHE_DIR / "jax"
 TMP_DIR = V35_ROOT / "tmp"
 WANDB_DIR = V35_ROOT / "wandb"
 
+# v4 worktree affordance (V4_PLAN.md §1): exactly these top-level entries may be symlinks
+# into another checkout of this same project, sharing the immutable bulk data (119G+) between
+# the v3 tree and the v4 worktree without duplication. Confinement treats a path below such a
+# link as project-internal; every other symlink escape remains rejected, as does any nested
+# escape below the link target.
+SHARED_DATA_LINKS = ("data",)
+
 V35_REPO_ID = "yam/bin_memory_0830_0831_v36_subtask"
 V35_DATASET_DIR = LEROBOT_HOME / V35_REPO_ID
 V35_FROZEN_MANIFEST = DATA_DIR / "0830_0831_episode_manifest_v36_frozen.json"
@@ -37,6 +44,16 @@ V35_ASSETS_ROOT = V35_ROOT / "assets"
 V35_ASSETS_DIR = V35_ASSETS_ROOT / "pi05_yam_0830_0831_v36"
 V35_CHECKPOINTS_DIR = V35_ROOT / "checkpoints"
 V35_DIAGNOSTICS_DIR = V35_ROOT / "diagnostics"
+
+# v4 (V4_PLAN.md): a real new artifact namespace instead of overloading the v35 constants the
+# way v36 did. Data inputs (manifest, dataset, fact-label sidecar) remain the frozen v36
+# files; only outputs and pinned assets get the new root.
+V4_ROOT = pathlib.PurePosixPath("v4")
+V4_FACT_LABELS = DATA_DIR / "v4_fact_labels_0830_0831.json"
+V4_ASSETS_ROOT = V4_ROOT / "assets"
+V4_ASSETS_DIR = V4_ASSETS_ROOT / "pi05_yam_0830_0831_v36"
+V4_CHECKPOINTS_DIR = V4_ROOT / "checkpoints"
+V4_DIAGNOSTICS_DIR = V4_ROOT / "diagnostics"
 
 
 class ProjectRootError(ValueError):
@@ -124,9 +141,22 @@ def project_path(relative_path: str | pathlib.PurePath) -> pathlib.Path:
     candidate = root.joinpath(*relative.parts).resolve()
     try:
         candidate.relative_to(root)
-    except ValueError as exc:
-        raise ProjectRootError(f"project path resolves outside memory_project: {str(relative)!r}") from exc
-    return candidate
+        return candidate
+    except ValueError:
+        pass
+    # Sanctioned shared-data links (v4 worktree): the path is accepted iff its first component
+    # is a listed top-level symlink and the fully resolved candidate stays below that link's
+    # resolved target -- a nested symlink jumping elsewhere still fails closed.
+    if relative.parts and relative.parts[0] in SHARED_DATA_LINKS:
+        link = root / relative.parts[0]
+        if link.is_symlink():
+            target = link.resolve()
+            try:
+                candidate.relative_to(target)
+                return candidate
+            except ValueError:
+                pass
+    raise ProjectRootError(f"project path resolves outside memory_project: {str(relative)!r}")
 
 
 def project_relative_path(path: str | pathlib.Path) -> pathlib.PurePosixPath:
@@ -139,8 +169,18 @@ def project_relative_path(path: str | pathlib.Path) -> pathlib.PurePosixPath:
     root = memory_project_root()
     try:
         relative = candidate.relative_to(root)
-    except ValueError as exc:
-        raise ProjectRootError(f"path is outside memory_project: {candidate}") from exc
+    except ValueError:
+        # Sanctioned shared-data links (v4 worktree): map a physical path below a link target
+        # back to its logical in-project spelling.
+        for name in SHARED_DATA_LINKS:
+            link = root / name
+            if link.is_symlink():
+                try:
+                    below = candidate.relative_to(link.resolve())
+                except ValueError:
+                    continue
+                return pathlib.PurePosixPath(name, *below.parts)
+        raise ProjectRootError(f"path is outside memory_project: {candidate}") from None
     return pathlib.PurePosixPath(*relative.parts)
 
 

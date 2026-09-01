@@ -187,6 +187,15 @@ def _l2_norm(x: at.Array, eps: float = 1e-6) -> at.Array:
     return x * jax.lax.rsqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + eps * eps)
 
 
+def l2_normalize(x: at.Array, eps: float = 1e-6) -> at.Array:
+    """Public smooth unit-L2 normalization (same form as `_l2_norm`: safe at exact zeros).
+
+    Exposed for callers that must match the memory core's normalization bit-for-bit, e.g. the
+    v4 fact-slot keys and predicted-fact values that enter `delta_write_kv_multi`.
+    """
+    return _l2_norm(x, eps)
+
+
 def _per_sample(gate: at.Array, leaf: at.Array) -> at.Array:
     """Reshape a [b] gate to broadcast against a [b, ...] weight leaf."""
     return gate.reshape(gate.shape + (1,) * (leaf.ndim - 1))
@@ -607,6 +616,131 @@ class TitansMemory(nnx.Module):
             "delta_w3_norm": jnp.linalg.norm(delta_w3, axis=(-2, -1)).astype(jnp.float32),
             "w3_norm": jnp.linalg.norm(new_w3, axis=(-2, -1)).astype(jnp.float32),
             "w3_maxabs": jnp.max(jnp.abs(new_w3), axis=(-2, -1)).astype(jnp.float32),
+        }
+        return new_state, aux
+
+    @at.typecheck
+    def delta_write_kv_multi(
+        self,
+        state: MemoryState,
+        k: at.Float[at.Array, "b f dk"],
+        v: at.Float[at.Array, "b f dv"],
+        commit_mask: at.Bool[at.Array, "b f"],
+    ) -> tuple[MemoryState, dict[str, at.Array]]:
+        """One memory step committing up to ``f`` independent associations (v4 semantic bank).
+
+        Unlike :meth:`delta_write_kv`, the slot axis is NOT pooled: each ``(k[:, i], v[:, i])``
+        is its own association, committed sequentially so a later slot's residual accounts for
+        every earlier commit within the same step. The fixed-alpha decay is applied exactly
+        once per call, so an all-``False`` mask is bit-identical to ``analytic_decay(state, 1)``
+        and the sparse-clock gap collapse stays valid across multi-slot steps.
+
+        Like :meth:`delta_write_kv` this is a *transition* API: any current-step read must
+        happen before it. Masked-off or degenerate slots leave the state untouched (fail-closed
+        to decay-only for that slot). ``f`` is a static compile-time slot budget; per-sample
+        eligibility lives entirely in ``commit_mask``.
+        """
+        if self.config.write_rule != "delta_output" or self.config.association_mode != "pooled_frame":
+            raise ValueError(
+                "delta_write_kv_multi requires write_rule='delta_output' and association_mode='pooled_frame'."
+            )
+        num_slots = k.shape[1]
+        if num_slots == 0:
+            raise ValueError("delta_write_kv_multi requires at least one slot.")
+        k = k.astype(jnp.float32)
+        v = v.astype(jnp.float32)
+        state = self._guard_delta_state(state)
+        if self.config.kv_cotangent_clip is not None:
+            k, v = _clip_state_cotangent((k, v), self.config.kv_cotangent_clip)
+
+        batch_size = k.shape[0]
+        rho = self._delta_decay_factor(jnp.ones((batch_size,), dtype=jnp.int32))
+        old_w3 = state.fast_weights[self._output_weight_name].astype(jnp.float32)
+        w3 = _per_sample(rho, old_w3) * old_w3
+        state_finite = jnp.all(jnp.isfinite(w3), axis=(-2, -1))
+        rate = jax.lax.stop_gradient(jnp.asarray(self.config.delta_rate, dtype=jnp.float32))
+
+        per_slot = {
+            name: []
+            for name in (
+                "pooled_key",
+                "pooled_value",
+                "hidden",
+                "association_valid",
+                "hidden_valid",
+                "commit_applied",
+                "pre_residual_norm",
+                "surprise",
+            )
+        }
+        for i in range(num_slots):
+            pooled = self.pool_kv(k[:, i : i + 1, :], v[:, i : i + 1, :])
+            pooled_key = pooled["pooled_key"]
+            pooled_value = pooled["pooled_value"]
+            hidden = self.hidden_key(state, pooled_key[:, None, :])[:, 0, :]
+            hidden_norm_sq = jnp.sum(jnp.square(hidden), axis=-1)
+            hidden_finite = jnp.all(jnp.isfinite(hidden), axis=-1) & jnp.isfinite(hidden_norm_sq)
+            hidden_valid = hidden_finite & (
+                hidden_norm_sq >= jnp.asarray(self.config.hidden_norm_sq_floor, dtype=jnp.float32)
+            )
+
+            # Residual against the CURRENT w3 (post-decay, post earlier same-step commits).
+            raw_prediction = jnp.einsum("bh,bhd->bd", hidden, w3, precision=jax.lax.Precision.HIGHEST)
+            raw_residual = pooled_value - raw_prediction
+            residual_finite = jnp.all(jnp.isfinite(raw_residual), axis=-1)
+            hidden_safe = jnp.where(jnp.isfinite(hidden), hidden, jnp.zeros_like(hidden))
+            residual_safe = jnp.where(jnp.isfinite(raw_residual), raw_residual, jnp.zeros_like(raw_residual))
+            denominator = jnp.where(hidden_valid, hidden_norm_sq, jnp.ones_like(hidden_norm_sq))
+            candidate_delta = (
+                rate
+                * jnp.einsum("bh,bd->bhd", hidden_safe, residual_safe, precision=jax.lax.Precision.HIGHEST)
+                / denominator[:, None, None]
+            )
+            delta_finite = jnp.all(jnp.isfinite(candidate_delta), axis=(-2, -1))
+            applied = (
+                commit_mask[:, i]
+                & pooled["association_valid"]
+                & state_finite
+                & hidden_valid
+                & residual_finite
+                & delta_finite
+            )
+            w3 = w3 + jnp.where(applied[:, None, None], candidate_delta, jnp.zeros_like(candidate_delta))
+
+            per_slot["pooled_key"].append(pooled_key)
+            per_slot["pooled_value"].append(pooled_value)
+            per_slot["hidden"].append(hidden_safe)
+            per_slot["association_valid"].append(pooled["association_valid"])
+            per_slot["hidden_valid"].append(hidden_valid)
+            per_slot["commit_applied"].append(applied)
+            pre_residual_norm = jnp.linalg.norm(residual_safe, axis=-1)
+            per_slot["pre_residual_norm"].append(pre_residual_norm)
+            per_slot["surprise"].append(jnp.sum(jnp.square(residual_safe), axis=-1))
+
+        new_state = self._canonical_delta_state(state, w3)
+        stacked = {name: jnp.stack(values, axis=1).astype(jnp.float32) for name, values in per_slot.items()}
+        for name in ("association_valid", "hidden_valid", "commit_applied"):
+            stacked[name] = stacked[name].astype(jnp.bool_)
+        # Commit quality against the FINAL state: with delta_rate=1 a committed slot only
+        # deviates from zero here through cross-slot hidden-feature overlap within this step.
+        final_prediction = jnp.einsum(
+            "bfh,bhd->bfd", stacked["hidden"], w3, precision=jax.lax.Precision.HIGHEST
+        )
+        final_read_residual = stacked["pooled_value"] - final_prediction
+        aux = {
+            "commit_requested": commit_mask,
+            **stacked,
+            "final_read_residual_norm": jnp.linalg.norm(final_read_residual, axis=-1).astype(jnp.float32),
+            "num_commits": jnp.sum(stacked["commit_applied"], axis=1).astype(jnp.int32),
+            "state_finite": state_finite,
+            "decay_factor": rho,
+            "alpha": jnp.full((batch_size,), self.config.alpha_step, dtype=jnp.float32),
+            "delta_rate": jnp.full((batch_size,), self.config.delta_rate, dtype=jnp.float32),
+            "delta_w3_norm": jnp.linalg.norm(
+                w3 - _per_sample(rho, old_w3) * old_w3, axis=(-2, -1)
+            ).astype(jnp.float32),
+            "w3_norm": jnp.linalg.norm(w3, axis=(-2, -1)).astype(jnp.float32),
+            "w3_maxabs": jnp.max(jnp.abs(w3), axis=(-2, -1)).astype(jnp.float32),
         }
         return new_state, aux
 
