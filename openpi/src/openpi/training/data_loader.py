@@ -1915,6 +1915,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    exact_resume: bool | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -1959,7 +1960,12 @@ def create_data_loader(
         skip_norm_stats=skip_norm_stats,
         framework=framework,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
-        exact_resume=getattr(config.model, "memory_v35_enabled", False),
+        # Exact (worker-free, RNG-snapshotting) continuation is the sealed v3.5 pilot
+        # protocol. Callers that run a v3.5 model outside that protocol (v4 Stage-1) pass
+        # an explicit False so the loader may use prefetching workers.
+        exact_resume=(
+            getattr(config.model, "memory_v35_enabled", False) if exact_resume is None else exact_resume
+        ),
     )
 
 

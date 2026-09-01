@@ -208,7 +208,8 @@ def _validate_v35_training_ready(config: _config.TrainConfig) -> None:
         raise ValueError("v3.5 requires the calibrated injection gate to remain frozen.")
     if not getattr(config.data.base_config, "memory_v35_frozen_population", False):
         raise ValueError("v3.5 training requires the frozen 70-episode Gate-A population lock.")
-    if config.num_workers != 0:
+    if config.num_workers != 0 and not v4_stage1:
+        # Stage-1 is not a sealed continuation and may prefetch with workers.
         raise ValueError("v3.5 exact continuation requires num_workers=0 so no batch can be prefetched.")
     if not config.data.base_config.memory_sequence_buckets:
         raise ValueError("v3.5 exact continuation requires the stateful sequence-bucket sampler.")
@@ -2251,6 +2252,9 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
+        # Stage-1 is not a sealed continuation: allow prefetching workers (num_workers=0
+        # starved the H100 at ~65 s/it in the v36 pilot until workers were enabled).
+        exact_resume=v35_enabled,
     )
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
