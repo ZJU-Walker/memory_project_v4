@@ -151,8 +151,22 @@ Done (commits `6a1b979`, `a897550`):
    (`v4/diagnostics/stage1_20260901_r1.log`; checkpoints every 500 under
    `v4/checkpoints/pi05_yam_mem_v4_stage1/v4_stage1_20260901_r1`).
 
+**Stage-1 verdict (2026-09-01 14:37): PASS.** r1 (A5000, batch 2, LR 1e-4, abstention only on
+decision steps) failed the two capability gates at ckpt-1000 (evidence accuracy 0.50 on dev AND
+train; pre-abstention 0.59) while all purity gates passed; the h8 linear probe showed the fact is
+present in frozen layer-8 features (0.98 OOF with 4x4 spatial pooling). After the fixes
+(`unknown` supervised on every non-observable step; LR 3e-4; batch 4 with 12 workers on an H100),
+r3 `v4_stage1_20260901_r3_h100` ckpt-500 passes all 7 gates: evidence accuracy 0.990
+(banana 1.000 / pepper 0.979; 0830 0.979 / 0831 1.000), pre-abstention 1.000, post-abstention
+1.000, prompt-swap 0.979, state-neutral 0.990, leak probes p=0.57/0.87 (train split, OOF);
+write-eligible rate 0.90. Report: `v4/diagnostics/stage1_eval_r3_500/stage1_eval.json`.
+H100 note: batch >= 6 on one H100 dies with CUDA_ERROR_ILLEGAL_ADDRESS at step 1
+(`v4/diagnostics/h100_isolation*/summary.txt`); batch 4 / 12 workers is the proven recipe.
+
 Next:
-1. Run the battery on the trained checkpoints:
+1. Confirm at ckpt-1000 (same battery), then freeze the Stage-1 artifact (ckpt-1000, or 500 if
+   1000 regresses) as the fact-head graft source for Stage 2.
+2. (superseded) Run the battery on the trained checkpoints:
    `.venv/bin/python scripts/v4_stage1_eval.py --params <ckpt>/params --output-dir v4/diagnostics/stage1_eval_<step>`
    (single GPU; wait for training to finish or use another machine).
 2. Decision point on the battery gates. Only on full PASS: per-bank injection calibration,
