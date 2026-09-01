@@ -878,6 +878,18 @@ class TrainConfig:
     v35_pilot_authorization_path: str | None = None
     v35_continuation_authorization_path: str | None = None
 
+    # v4 run protocol (V4_PLAN.md): a clean break from the v3.5 seal. A v4 run uses the plain
+    # train step (no checkified accounting guard), no calibration lock / pilot authorization /
+    # bootstrap-0 resume / telemetry ledger, and records a small self-describing
+    # `v4_run_manifest.json` (config identity, git commit, graft sources) in its checkpoint
+    # directory instead. Only meaningful with a memory_v4_dual_bank model.
+    v4_protocol: bool = False
+    # Extra graft sources applied AFTER the main weight loader: (leaf-path regex, params dir).
+    # Leaves whose "/"-joined path fully matches the regex are overwritten from that params
+    # tree (shape and dtype must match exactly; never a silent cast). Stage 2a uses this to
+    # take fact_* from the Stage-1 checkpoint while the backbone comes from pi05_base.
+    v4_graft_sources: tuple[tuple[str, str], ...] = ()
+
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
@@ -2069,6 +2081,7 @@ _CONFIGS = [
         ): (
             TrainConfig(
                 name="pi05_yam_mem_v4",
+                v4_protocol=True,
                 model=v4_model,
                 data=v4_data,
                 assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
@@ -2108,6 +2121,7 @@ _CONFIGS = [
             ),
             TrainConfig(
                 name="pi05_yam_mem_v4_stage1",
+                v4_protocol=True,
                 # Stage 1 (V4_PLAN.md §5): visually-grounded facts BEFORE memory training.
                 # Same model tree (checkpoints graft forward), but only the fact head trains:
                 # everything not matching fact_ is frozen, the semantic write/read losses are
@@ -2159,6 +2173,88 @@ _CONFIGS = [
                 save_interval=500,
                 keep_period=500,
                 num_workers=0,
+                fsdp_devices=1,
+            ),
+            TrainConfig(
+                name="pi05_yam_mem_v4_stage2a",
+                v4_protocol=True,
+                # Stage 2a (V4_PLAN.md §5): semantic memory ONLY, with ORACLE writes. The
+                # frozen Stage-1 fact head is grafted in (v4_graft_sources); the semantic bank
+                # commits the ground-truth fact embedding on observable E steps; the visual
+                # bank still evolves but injects nothing. What trains is the USE path: the
+                # backbone/action expert reading the semantic tokens, the semantic slot
+                # embeddings, and the read-side fact head. The 2a/2b gap later measures
+                # perception error once predicted writes replace the oracle.
+                model=dataclasses.replace(
+                    v4_model,
+                    memory_fact_oracle_writes=True,
+                    memory_v4_visual_injection=False,
+                    memory_fact_loss_weight=0.0,
+                    memory_fact_read_loss_weight=0.3,
+                    # v3.4 residual-stream constant: unit-norm fact values retrieve at
+                    # RMS ~1/sqrt(2048) > tau, so the tanh_rms floor is inactive and the
+                    # injection sits at 0.5 * c of residual scale. Pinned, not calibrated:
+                    # v4 runs its own light protocol.
+                    memory_sem_injection_c=12.4,
+                    memory_sem_injection_tau=0.02,
+                    memory_sem_injection_gate_init=0.5,
+                    # The visual side losses stay nonzero for the v3.5 core validation but
+                    # every parameter they could reach is frozen below, so they are inert.
+                    memory_write_side_loss_weight=1e-6,
+                    memory_read_side_loss_weight=1e-6,
+                ),
+                data=v4_data,
+                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
+                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
+                # Frozen: the Stage-1 fact head (keys/compressor/logit head/value embed -- the
+                # oracle values must stay fixed), both injection gates, and the entire VISUAL
+                # memory subsystem (its 1e-6-weighted side losses would otherwise drive
+                # full-size Adam updates on parameters nothing else touches). Trainable:
+                # backbone, action expert, memory_semantic core, semantic slot embeddings,
+                # memory_fact_read_head.
+                freeze_filter=nnx_utils.PathRegex(
+                    r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed"
+                    r"|memory/|memory_gate|memory_inject_w|memory_sem_inject_w|memory_semantic/gate"
+                    r"|memory_write_side_head|memory_read_side_head"
+                    r"|read_query_compressor|write_query_compressor|write_query_conditioner).*"
+                ),
+                batch_size=4,
+                gradient_accumulation_steps=1,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=200,
+                    peak_lr=5e-5,
+                    decay_steps=10_000,
+                    decay_lr=5e-5,
+                ),
+                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+                memory_grad_clip=5.0,
+                ema_decay=None,
+                probe_lr=1e-2,
+                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+                    "gs://openpi-assets/checkpoints/pi05_base/params",
+                    matched_allowlist=(
+                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+                    ),
+                    fresh_init_allowlist=(
+                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+                    ),
+                ),
+                # The trained Stage-1 fact head overlays the fresh-init fact_* leaves.
+                v4_graft_sources=(
+                    (
+                        r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed).*",
+                        str(
+                            _project_paths.project_path(
+                                _project_paths.V4_CHECKPOINTS_DIR
+                                / "pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params"
+                            )
+                        ),
+                    ),
+                ),
+                num_train_steps=1_000,
+                save_interval=250,
+                keep_period=250,
+                num_workers=12,
                 fsdp_devices=1,
             ),
         )

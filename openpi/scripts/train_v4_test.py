@@ -1,11 +1,12 @@
-"""v4 host-side training contracts: Stage-1 detection, calibration-lock carve-out, gates."""
+"""v4 host-side training contracts: the light v4 protocol, graft overlays, gates."""
 
 import dataclasses
+import pathlib
 
 import numpy as np
 import pytest
 
-import openpi.shared.nnx_utils as nnx_utils
+import openpi.models.model as _model
 import openpi.training.config as _config
 import train as train_script
 
@@ -18,42 +19,69 @@ def _full_v4_config() -> _config.TrainConfig:
     return _config.get_config("pi05_yam_mem_v4")
 
 
-def test_stage1_shape_is_detected_and_full_v4_is_not():
+def test_every_registered_v4_config_is_a_v4_protocol_run():
+    assert train_script._is_v4_run(_stage1_config())
+    assert train_script._is_v4_run(_full_v4_config())
+    assert not train_script._is_v4_run(_config.get_config("pi05_yam_mem_v35"))
+    # The Stage-1 shape detector still identifies the fact-head-only recipe.
     assert train_script._is_v4_stage1_config(_stage1_config())
     assert not train_script._is_v4_stage1_config(_full_v4_config())
-    assert not train_script._is_v4_stage1_config(_config.get_config("pi05_yam_mem_v35"))
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        # Any drift from the sealed Stage-1 shape falls back to the full calibration lock.
-        lambda c: dataclasses.replace(c, freeze_filter=nnx_utils.PathRegex(r".*fact_.*")),
-        lambda c: dataclasses.replace(
-            c, model=dataclasses.replace(c.model, memory_sem_injection_gate_init=0.5)
-        ),
-        lambda c: dataclasses.replace(
-            c, model=dataclasses.replace(c.model, memory_fact_read_loss_weight=0.1)
-        ),
-        lambda c: dataclasses.replace(
-            c, model=dataclasses.replace(c.model, memory_fact_loss_weight=0.0)
-        ),
-    ],
-)
-def test_any_stage1_shape_drift_reinstates_the_calibration_lock(mutation):
-    drifted = mutation(_stage1_config())
-    assert not train_script._is_v4_stage1_config(drifted)
-    with pytest.raises(ValueError, match="calibration"):
-        train_script._validate_v35_training_ready(drifted)
-
-
-def test_stage1_passes_training_readiness_without_a_calibration_artifact():
+def test_v4_runs_pass_readiness_without_the_v35_seal_and_v35_runs_still_lock():
     train_script._validate_v35_training_ready(_stage1_config())
-
-
-def test_full_v4_stays_behind_the_calibration_lock():
+    train_script._validate_v35_training_ready(_full_v4_config())
     with pytest.raises(ValueError, match="calibration"):
-        train_script._validate_v35_training_ready(_full_v4_config())
+        train_script._validate_v35_training_ready(_config.get_config("pi05_yam_mem_v35"))
+
+
+def test_v4_contract_rejects_missing_sidecar_pin_ema_and_bad_graft_sources(tmp_path):
+    config = _full_v4_config()
+    with pytest.raises(ValueError, match="ema_decay"):
+        train_script._validate_v4_run(dataclasses.replace(config, ema_decay=0.99))
+    # An unpinned sidecar cannot even be constructed: DataConfig enforces the pin first.
+    with pytest.raises(ValueError, match="pinned SHA256"):
+        dataclasses.replace(config.data.base_config, memory_v4_fact_labels_sha256=None)
+    with pytest.raises(ValueError, match="does not exist"):
+        train_script._validate_v4_run(
+            dataclasses.replace(config, v4_graft_sources=((r".*fact_.*", str(tmp_path / "missing")),))
+        )
+    # Requiring v4_protocol on a non-dual-bank model is refused too.
+    v35 = _config.get_config("pi05_yam_mem_v35")
+    with pytest.raises(ValueError, match="memory_v4_dual_bank"):
+        train_script._validate_v4_run(dataclasses.replace(v35, v4_protocol=True))
+
+
+def test_graft_overlay_replaces_only_matching_leaves_and_never_casts(monkeypatch, tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    shape = {
+        "fact_logit_head": {"kernel": np.zeros((4, 3), np.float32), "bias": np.zeros((3,), np.float32)},
+        "PaliGemma": {"llm": {"w": np.zeros((2, 2), np.float32)}},
+    }
+    partial = {"PaliGemma": {"llm": {"w": np.ones((2, 2), np.float32)}}}
+    source = {
+        "fact_logit_head": {"kernel": np.full((4, 3), 7.0, np.float32), "bias": np.full((3,), 2.0, np.float32)},
+        "PaliGemma": {"llm": {"w": np.full((2, 2), 9.0, np.float32)}},
+    }
+    monkeypatch.setattr(_model, "restore_params", lambda path, restore_type=None: source)
+    config = dataclasses.replace(_full_v4_config(), v4_graft_sources=((r"fact_logit_head/.*", str(source_dir)),))
+    merged = train_script._apply_v4_graft_sources(config, partial, shape)
+    np.testing.assert_array_equal(merged["fact_logit_head"]["kernel"], 7.0)
+    np.testing.assert_array_equal(merged["fact_logit_head"]["bias"], 2.0)
+    # The backbone leaf keeps the main loader's value: the regex did not match it.
+    np.testing.assert_array_equal(merged["PaliGemma"]["llm"]["w"], 1.0)
+
+    # dtype drift is refused, and a regex matching nothing is refused.
+    bad = {"fact_logit_head": {"kernel": np.full((4, 3), 7.0, np.float16), "bias": source["fact_logit_head"]["bias"]}}
+    monkeypatch.setattr(_model, "restore_params", lambda path, restore_type=None: bad)
+    with pytest.raises(ValueError, match="never cast"):
+        train_script._apply_v4_graft_sources(config, partial, shape)
+    monkeypatch.setattr(_model, "restore_params", lambda path, restore_type=None: source)
+    with pytest.raises(ValueError, match="matched no leaf"):
+        train_script._apply_v4_graft_sources(
+            dataclasses.replace(config, v4_graft_sources=((r"nonexistent/.*", str(source_dir)),)), partial, shape
+        )
 
 
 def test_inject_gate_filter_covers_both_banks_gates_and_nothing_else():

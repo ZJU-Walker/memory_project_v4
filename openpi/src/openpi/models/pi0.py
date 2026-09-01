@@ -4103,7 +4103,13 @@ class Pi0(_model.BaseModel):
         return x_0, new_state, aux
 
     def _compute_sequence_loss_v32(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        v4_intervention: str | None = None,
     ) -> dict[str, at.Array]:
         """Sequence objective for the layer-8 dual-query v3.2 interface.
 
@@ -4124,6 +4130,17 @@ class Pi0(_model.BaseModel):
             (evidence frames) and from stop-gradient'ed pooled standard-read retrieval
             (waiting frames). Head updates are isolated in train.py.
         """
+
+        # Stage-2 "use" interventions (V4_PLAN.md §10, ladder rung 5): on DECISION steps the
+        # semantic bank the model READS is replaced -- "reset": a fresh (exactly-zero) bank;
+        # "donor": the batch neighbour's bank (jnp.roll over the batch axis; the battery
+        # pairs opposite-side episodes). The carried state and every write are untouched, so
+        # only the read-side counterfactual differs. Diagnostics only; never used in training.
+        if v4_intervention is not None:
+            if v4_intervention not in ("reset", "donor"):
+                raise ValueError(f"unsupported v4_intervention {v4_intervention!r}.")
+            if train:
+                raise ValueError("v4_intervention is an evaluation-only control.")
 
         b, t = observation.seq_step_mask.shape
         ah, ad = actions.shape[-2:]
@@ -4160,6 +4177,8 @@ class Pi0(_model.BaseModel):
                 raise ValueError("v4 dual-bank sequence training requires the v3.5 sequence semantics.")
             if observation.seq_fact_labels is None or observation.seq_fact_observable is None:
                 raise ValueError("v4 sequence training requires seq_fact_labels and seq_fact_observable.")
+        if v4_intervention is not None and not v4_on:
+            raise ValueError("v4_intervention requires a memory_v4_dual_bank model.")
         mask_state = (
             getattr(self, "memory_state_mask_prob", 0.0) > 0
             and observation.seq_state_masked is not None
@@ -4360,6 +4379,18 @@ class Pi0(_model.BaseModel):
                 )
             else:
                 masked_prefix_tokens = prefix_tokens
+            read_sem_state = sem_state if v4_on else None
+            if v4_on and v4_intervention is not None:
+                if v4_intervention == "reset":
+                    alternative = self.memory_semantic.init_state(b)
+                else:
+                    alternative = jax.tree.map(lambda leaf: jnp.roll(leaf, 1, axis=0), sem_state)
+                intervene = x["decision_mask"] & x["step_valid"]
+                read_sem_state = jax.tree.map(
+                    lambda alt, own: jnp.where(intervene.reshape((b,) + (1,) * (own.ndim - 1)), alt, own),
+                    alternative,
+                    sem_state,
+                )
             prepared = self._v32_prepare_memory_prefix(
                 masked_prefix_tokens,
                 prefix_mask,
@@ -4367,7 +4398,7 @@ class Pi0(_model.BaseModel):
                 state,
                 top_token_count=top_tokens,
                 state_token_mask=state_token_mask,
-                semantic_state=sem_state if v4_on else None,
+                semantic_state=read_sem_state,
             )
             if dual_view:
                 # Plan 5.2 gold-standard variant: memory-state evolution from the FULL view
@@ -4615,8 +4646,18 @@ class Pi0(_model.BaseModel):
                     fact_read_correct = (jnp.argmax(fact_read_logits, axis=-1) == fact_labels).astype(jnp.float32)
 
                     sem_requested = sem_aux["commit_requested"]
+                    # "Use" telemetry for the Stage-2 battery: the task losses restricted to
+                    # decision steps (subtask CE) and to use-pressure steps whose action
+                    # chunk reaches the side-dependent execute phase (flow). Under the
+                    # reset/donor interventions these are the causal read-outs.
+                    decision_active = (x["decision_mask"] & transition_valid).astype(jnp.float32)
+                    use_active = (x["use_pressure_mask"] & transition_valid).astype(jnp.float32)
                     outputs.update(
                         {
+                            "v4_decision_ce": ce * decision_active,
+                            "v4_decision_count": decision_active,
+                            "v4_use_flow": flow * use_active,
+                            "v4_use_count": use_active,
                             "v4_fact_ce": fact_ce * fact_active,
                             "v4_fact_correct": fact_correct * fact_active,
                             "v4_fact_active": fact_active,
@@ -4839,6 +4880,10 @@ class Pi0(_model.BaseModel):
                     "v4_fact_ce_class_sum": jnp.sum(weighted * ys["v4_fact_ce"][..., None], axis=(0, 1, 2)),
                     "v4_fact_count_class": jnp.sum(weighted, axis=(0, 1, 2)),
                     "v4_fact_correct_class": jnp.sum(weighted * ys["v4_fact_correct"][..., None], axis=(0, 1, 2)),
+                    "v4_decision_ce_sum": jnp.sum(ys["v4_decision_ce"]),
+                    "v4_decision_count": jnp.sum(ys["v4_decision_count"]),
+                    "v4_use_flow_sum": jnp.sum(ys["v4_use_flow"]),
+                    "v4_use_count": jnp.sum(ys["v4_use_count"]),
                     "v4_fact_read_ce_sum": jnp.sum(ys["v4_fact_read_ce"]),
                     "v4_fact_read_count": jnp.sum(ys["v4_fact_read_active"]),
                     "v4_fact_read_correct": jnp.sum(ys["v4_fact_read_correct"]),

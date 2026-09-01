@@ -343,6 +343,33 @@ def test_v4_oracle_writes_commit_exactly_the_observable_real_slots(tiny_v4_seq):
         assert np.isfinite(np.asarray(value)).all(), key
 
 
+def test_v4_reset_intervention_blanks_only_the_decision_step_read(tiny_v4_seq):
+    observation = _v4_sequence_observation()
+    actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)
+    normal = tiny_v4_seq._compute_sequence_loss_v32(jax.random.key(47), observation, actions, train=False)
+    reset = tiny_v4_seq._compute_sequence_loss_v32(
+        jax.random.key(47), observation, actions, train=False, v4_intervention="reset"
+    )
+    # Same writes either way (the carried state is untouched by the intervention) ...
+    np.testing.assert_array_equal(reset["v4_sem_commit_count"], normal["v4_sem_commit_count"])
+    # ... but the decision-step read is a fresh bank: less total raw retrieval, and the
+    # read-side fact terms on that step decode from zeros.
+    assert float(reset["v4_sem_raw_read_rms_sum"]) < float(normal["v4_sem_raw_read_rms_sum"])
+    np.testing.assert_array_equal(reset["v4_decision_count"], 1.0)
+    np.testing.assert_array_equal(reset["v4_use_count"], 1.0)
+    for key, value in reset.items():
+        assert np.isfinite(np.asarray(value)).all(), key
+    # Batch of one: the donor roll is the sample itself, so donor == normal bitwise.
+    donor = tiny_v4_seq._compute_sequence_loss_v32(
+        jax.random.key(47), observation, actions, train=False, v4_intervention="donor"
+    )
+    np.testing.assert_array_equal(np.asarray(donor["v4_decision_ce_sum"]), np.asarray(normal["v4_decision_ce_sum"]))
+    with pytest.raises(ValueError, match="evaluation-only"):
+        tiny_v4_seq._compute_sequence_loss_v32(
+            jax.random.key(47), observation, actions, train=True, v4_intervention="reset"
+        )
+
+
 def test_v4_sequence_requires_fact_fields_and_interface_requires_semantic_state(tiny_v4_seq):
     observation = _v35_sequence_observation()
     actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)

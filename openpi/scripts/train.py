@@ -185,10 +185,113 @@ def _is_v4_stage1_config(config: _config.TrainConfig) -> bool:
     )
 
 
+def _is_v4_run(config: _config.TrainConfig) -> bool:
+    """A v4-protocol run: dual-bank model under the light v4 contract (V4_PLAN.md), which
+    deliberately replaces the v3.5 seal machinery rather than extending it."""
+    return bool(config.v4_protocol) and getattr(config.model, "memory_v4_dual_bank", False)
+
+
+def _validate_v4_run(config: _config.TrainConfig) -> None:
+    """The v4 contract: dual-bank model, pinned fact sidecar, no EMA, explicit graft sources."""
+    if not getattr(config.model, "memory_v4_dual_bank", False):
+        raise ValueError("v4_protocol requires a memory_v4_dual_bank model.")
+    if config.data.base_config.memory_v4_fact_labels_sha256 is None:
+        raise ValueError("v4 runs require the pinned fact-label sidecar (memory_v4_fact_labels_sha256).")
+    if config.ema_decay is not None:
+        raise ValueError("v4 runs use raw parameters as primary; set ema_decay=None.")
+    for regex, params_path in config.v4_graft_sources:
+        re.compile(regex)
+        if not pathlib.Path(params_path).is_dir():
+            raise ValueError(f"v4 graft source does not exist: {params_path}")
+
+
+def _apply_v4_graft_sources(
+    config: _config.TrainConfig, partial_params: at.Params, params_shape: at.Params
+) -> at.Params:
+    """Overlay leaves from extra params trees (Stage 2a: fact_* from the Stage-1 checkpoint).
+
+    Every overlaid leaf must exist in the model, match shape and dtype exactly (no silent
+    cast), and each regex must match at least one leaf so a typo cannot silently graft
+    nothing. Returns the merged partial-params tree.
+    """
+    if not config.v4_graft_sources:
+        return partial_params
+    merged = dict(traverse_util.flatten_dict(partial_params))
+    expected = traverse_util.flatten_dict(params_shape)
+    for regex, params_path in config.v4_graft_sources:
+        pattern = re.compile(regex)
+        source = traverse_util.flatten_dict(_model.restore_params(params_path, restore_type=np.ndarray))
+        hits = 0
+        for path, value in source.items():
+            joined = "/".join(str(part) for part in path)
+            if not pattern.fullmatch(joined):
+                continue
+            if path not in expected:
+                raise ValueError(f"v4 graft leaf {joined!r} from {params_path} does not exist in the model.")
+            spec = expected[path]
+            if tuple(value.shape) != tuple(spec.shape) or np.dtype(value.dtype) != np.dtype(spec.dtype):
+                raise ValueError(
+                    f"v4 graft leaf {joined!r}: source {value.shape}/{value.dtype} vs model "
+                    f"{spec.shape}/{spec.dtype}; grafts never cast silently."
+                )
+            merged[path] = value
+            hits += 1
+        if hits == 0:
+            raise ValueError(f"v4 graft regex {regex!r} matched no leaf in {params_path}.")
+        logging.info("v4 graft: %d leaves matching %r overlaid from %s", hits, regex, params_path)
+    return traverse_util.unflatten_dict(merged)
+
+
+def _write_v4_run_manifest(config: _config.TrainConfig, params: nnx.State) -> pathlib.Path:
+    """Light provenance for a v4 run: what trained, from what, at which code revision."""
+    checkpoint_dir = pathlib.Path(config.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    root = project_paths.memory_project_root()
+    try:
+        import subprocess
+
+        commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+        )
+    except OSError:
+        commit, dirty = "unknown", True
+    manifest = {
+        "schema_version": "openpi.v4.run-manifest.v1",
+        "config_name": config.name,
+        "experiment_name": config.exp_name,
+        "seed": int(config.seed),
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "config_repr_sha256": hashlib.sha256(repr(config).encode("utf-8")).hexdigest(),
+        "weight_loader": repr(config.weight_loader),
+        "v4_graft_sources": [list(item) for item in config.v4_graft_sources],
+        "fact_labels_sha256": config.data.base_config.memory_v4_fact_labels_sha256,
+        "episode_manifest_sha256": config.data.base_config.memory_episode_manifest_sha256,
+        "initialization_parameter_tree_sha256": _weight_loaders.parameter_tree_sha256(params.to_pure_dict()),
+        "host": platform.node(),
+    }
+    path = checkpoint_dir / "v4_run_manifest.json"
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    logging.info("v4 run manifest written: %s (commit %s%s)", path, commit[:12], " dirty" if dirty else "")
+    return path
+
+
 def _validate_v35_training_ready(config: _config.TrainConfig) -> None:
     """Refuse a v3.5 optimizer run whose fresh-base/calibration contract is incomplete."""
     model_config = config.model
     if not getattr(model_config, "memory_v35_enabled", False):
+        return
+    if _is_v4_run(config):
+        # v4 replaces the v3.5 seal with its own light contract (V4_PLAN.md §8).
+        _validate_v4_run(config)
         return
     v4_stage1 = _is_v4_stage1_config(config)
     if not getattr(model_config, "memory_v35_calibrated", False) and not v4_stage1:
@@ -1587,6 +1690,7 @@ def init_train_state(
         lambda rng: nnx.state(config.model.create(jax.random.split(rng)[1])), init_rng
     )
     partial_params = _load_weights_and_validate(_weight_loader_for_run(config), uncast_params_shape.to_pure_dict())
+    partial_params = _apply_v4_graft_sources(config, partial_params, uncast_params_shape.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
@@ -2149,7 +2253,10 @@ def main(config: _config.TrainConfig):
     # shape trains as an ordinary run: nothing optimizes through any injection, so there is no
     # calibrated pathway to seal. The device-side runtime accounting guard stays active for
     # every memory_v35_enabled model, Stage-1 included.
-    v35_enabled = getattr(config.model, "memory_v35_enabled", False) and not _is_v4_stage1_config(config)
+    v4_run = _is_v4_run(config)
+    v35_enabled = (
+        getattr(config.model, "memory_v35_enabled", False) and not _is_v4_stage1_config(config) and not v4_run
+    )
     v35_pilot_authorization: _v35_authorization.AuthorizationRecord | None = None
     if v35_enabled:
         v35_pilot_authorization = _v35_authorization.load_and_validate_pilot_authorization(config)
@@ -2281,6 +2388,8 @@ def main(config: _config.TrainConfig):
         else:
             train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
     _validate_v35_initialized_gate(config, train_state.params)
+    if v4_run and not resuming:
+        _write_v4_run_manifest(config, train_state.params)
 
     initialization_manifest_path = None
     if v35_enabled:
@@ -2367,7 +2476,8 @@ def main(config: _config.TrainConfig):
         ]
         wandb.log({"camera_views": images_to_log}, step=0)
 
-    v35_runtime_guard = getattr(config.model, "memory_v35_enabled", False)
+    # v4 runs use the plain train step: no checkified guard (and no per-step device sync).
+    v35_runtime_guard = getattr(config.model, "memory_v35_enabled", False) and not v4_run
     if v35_runtime_guard:
         # `checkify` carries device-side assertion state out of the compiled update.  The host
         # throws before accepting/donating the candidate state, so an invalid update can never
