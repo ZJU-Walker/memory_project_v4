@@ -11,7 +11,7 @@
 | Item | Value |
 |---|---|
 | Repository | standalone git repo, branch `v4` (full history preserved back through the v3 lineage; formerly a worktree of `memory_project`) |
-| Data | `data/` is a REAL in-repo directory (gitignored): the converted v36 LeRobot dataset (39G, byte-verified copy), every `0830_0831*` manifest JSON incl. approval ledger + inventory, and the v4 fact sidecar. Raw episode recordings deliberately stay with the old project — v4's contract is the frozen converted dataset. |
+| Data | `data/` is a REAL in-repo directory (gitignored, ~40G): the converted v36 LeRobot dataset (39G, byte-verified copy), every `0830_0831*` manifest JSON incl. approval ledger + inventory, the v4 fact sidecar, AND the three raw collection folders the frozen manifest references (`0830_bin_part1`, `0830_bin_part2`, `0831_bin`, ~1G) — the v3.5 frozen-record validator hashes each episode's raw `subtask_labels.json` at loader init. Only 0830+0831 data exists here; 0816 was excluded at the v36 freeze (Gate-B leak) and is not present in any form. |
 | v4 artifacts | `v4/{diagnostics,assets,checkpoints}` (gitignored) |
 | Python env | own `openpi/.venv` via `GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen`; recreate the same way on a new cluster |
 | Caches | repo-local under `v35/cache/` (the path name is the portable runtime contract of `project_paths`): JAX cache, HF caches, and the pi05_base checkpoint cache (12G, pre-seeded). A new cluster re-downloads pi05_base automatically if absent. |
