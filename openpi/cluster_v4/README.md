@@ -163,9 +163,33 @@ write-eligible rate 0.90. Report: `v4/diagnostics/stage1_eval_r3_500/stage1_eval
 H100 note: batch >= 6 on one H100 dies with CUDA_ERROR_ILLEGAL_ADDRESS at step 1
 (`v4/diagnostics/h100_isolation*/summary.txt`); batch 4 / 12 workers is the proven recipe.
 
-Next:
-1. Confirm at ckpt-1000 (same battery), then freeze the Stage-1 artifact (ckpt-1000, or 500 if
-   1000 regresses) as the fact-head graft source for Stage 2.
+**Stage-1 confirmed at ckpt-1000** (all gates 1.000; leak p 0.70/0.68). Stage-1 artifact:
+`v4/checkpoints/pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params`.
+
+**Protocol decision (user, 2026-09-01 15:12): v4 is a clean break from the v3.5 seal.** Every
+v4 config sets `v4_protocol=True` (train.py): plain train step (no checkified guard), no
+calibration lock / pilot authorization / bootstrap-0 resume / telemetry ledger, a small
+`v4_run_manifest.json` per run (config identity, git commit, graft sources, init-tree hash),
+and `v4_graft_sources` overlays (Stage 2a takes the trained fact head from the Stage-1
+checkpoint; the backbone still comes from pi05_base). Adversarial testing happens through
+the v4 batteries once each stage's pieces exist.
+
+**Stage 2a launched** (`pi05_yam_mem_v4_stage2a`, exp `v4_stage2a_20260901_r1`, GPU 3):
+oracle semantic writes on observable E steps, visual injection off, fact head frozen,
+semantic gate 0.5 with the v3.4 constant c=12.4 (pinned, not calibrated), backbone /
+action expert / semantic core / slot embeddings / read head training at the v3.5 schedule,
+1000 updates. Battery: `scripts/v4_stage2_eval.py --params <ckpt>/params --output-dir ...`
+(normal / reset / donor read-side interventions on decision steps; decision-step subtask CE,
+use-pressure flow, read accuracy; provisional causal gates). H100 recipe: batch 4, 12
+workers (batch >= 6 dies with CUDA_ERROR_ILLEGAL_ADDRESS at step 1).
+
+Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
+`memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception
+error; then dual-bank inference (`sample_with_memory`) for sampled-action interventions, then
+Stage 4 (both banks).
+
+Historical (superseded) next-steps:
+1. (done) Confirm at ckpt-1000, freeze the Stage-1 artifact.
 2. (superseded) Run the battery on the trained checkpoints:
    `.venv/bin/python scripts/v4_stage1_eval.py --params <ckpt>/params --output-dir v4/diagnostics/stage1_eval_<step>`
    (single GPU; wait for training to finish or use another machine).
