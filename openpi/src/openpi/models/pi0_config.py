@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -383,7 +384,9 @@ class Pi0Config(_model.BaseModelConfig):
                 # Compare in FP32: the memory core computes decay in float32, and checkpoint
                 # identities record the fp32 runtime value (0.009999999776…), which is the
                 # same frozen constant under runtime arithmetic.
-                if float(jnp.float32(self.memory.alpha_step)) != float(jnp.float32(0.01)):
+                # numpy, not jnp: config __post_init__ runs inside spawned data-loader
+                # workers, where a jnp call initializes a JAX backend and fails CUDA init.
+                if float(np.float32(self.memory.alpha_step)) != float(np.float32(0.01)):
                     raise ValueError("v3.5 Revision 4 freezes memory.alpha_step=0.01 per 15-frame step.")
                 if not self.memory.blank_initial_output:
                     raise ValueError("v3.5 requires blank_initial_output=True for an exact-zero reset memory.")
@@ -420,7 +423,7 @@ class Pi0Config(_model.BaseModelConfig):
                 # v4-Base runs both banks on one sparse clock so a skipped span collapses with a
                 # single per-bank factor of the same gap length. Compare in FP32 like the v3.5
                 # alpha pin (checkpoint identities record the fp32 runtime value).
-                if float(jnp.float32(self.memory_semantic.alpha_step)) != float(jnp.float32(self.memory.alpha_step)):
+                if float(np.float32(self.memory_semantic.alpha_step)) != float(np.float32(self.memory.alpha_step)):
                     raise ValueError("v4-Base requires memory_semantic.alpha_step == memory.alpha_step (fp32).")
                 if (
                     self.memory_semantic.d_input != paligemma_config.width
