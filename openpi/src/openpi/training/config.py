@@ -2212,13 +2212,19 @@ _CONFIGS = [
                 # full-size Adam updates on parameters nothing else touches). Trainable:
                 # backbone, action expert, memory_semantic core, semantic slot embeddings,
                 # memory_fact_read_head.
+                # Also frozen: the SigLIP tower and the 257k-token embedding table. Neither
+                # can influence how injected memory is USED (semantic tokens enter at block 9),
+                # and together they are ~0.9B parameters of FP32 master weights + Adam state
+                # that do not fit on one H100 next to the trainable LLM blocks (measured: a
+                # 49.9 GB allocation OOM at batch 4 with them trainable).
                 freeze_filter=nnx_utils.PathRegex(
                     r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed"
                     r"|memory/|memory_gate|memory_inject_w|memory_sem_inject_w|memory_semantic/gate"
                     r"|memory_write_side_head|memory_read_side_head"
-                    r"|read_query_compressor|write_query_compressor|write_query_conditioner).*"
+                    r"|read_query_compressor|write_query_compressor|write_query_conditioner"
+                    r"|PaliGemma/img/|PaliGemma/llm/embedder).*"
                 ),
-                batch_size=4,
+                batch_size=2,
                 gradient_accumulation_steps=1,
                 lr_schedule=_optimizer.CosineDecaySchedule(
                     warmup_steps=200,
