@@ -128,10 +128,36 @@ Unchanged from the draft §13: grounded facts on fresh data (Stage 1), per-bank 
 
 ---
 
-## 8. Immediate next actions on `v4`
+## 8. Status (2026-09-01)
 
-1. `uv sync` the worktree venv; create `cluster_v4/env.sh` (own `MEMORY_PROJECT_ROOT`, own JAX/UV caches). *(venv build already launched)*
-2. Implement chunk A: `memory_v4_dual_bank` config + `memory_semantic` + fact keys/head/value embed + semantic injection, with default-off bit-identity tests vs the v36 config.
-3. Implement chunk B: `v4_build_fact_labels.py` (derive from frozen manifest, hashed sidecar) + audit test.
-4. Implement chunk C: Stage-1 config + fact leak battery (clone `v35_leakage_*` with the fact-feature probe).
-5. Launch Stage 1 on a free GPU. Decision point on its gates before any memory training.
+Done (commits `6a1b979`, `a897550`):
+1. Worktree venv + `cluster_v4/{env.sh,stage1_train.sh}` (worktree-local caches, fresh JAX cache).
+2. Chunk A: dual-bank model core -- `delta_write_kv_multi`, independent semantic bank via the
+   key-space API, memory-blind fact head on h8, `_memory_token_total` layout property, full
+   `_compute_sequence_loss_v32` integration, `v4_fact_probe_step`. Bit-identity when off proven
+   by the complete v3.2/v3.3/v3.4/v3.5 regression suites.
+3. Chunk B: fact sidecar (`data/v4_fact_labels_0830_0831.json`, triple-authenticated in the
+   loader), `MemoryV4FactLabels` transform, configs `pi05_yam_mem_v4` + `pi05_yam_mem_v4_stage1`.
+4. train.py: class-balanced macro fact CE + read-side CE in both loss paths; Stage-1
+   calibration-lock carve-out (`_is_v4_stage1_config`; the lock is vacuous, not bypassed --
+   nothing trains through any injection; any shape drift reinstates it); host-side v3.5
+   machinery keyed off for Stage-1 while the device-side accounting guard stays on; per-bank
+   gate validation; two latent bugs fixed (None-leaf BF16 cast, pre-cast graft target spec).
+5. Stage-1 battery `scripts/v4_stage1_eval.py`: evidence accuracy + write eligibility,
+   pre/post abstention, prompt-swap + state-neutral agreement (dev split), Gate-B-style
+   episode-OOF leak probes with stratified permutation nulls (train split -- an 8-episode
+   split's ~36-arrangement permutation space cannot support the 0.05 gate).
+6. Smoke green on the A5000 (`v4/diagnostics/stage1_smoke_r5.log`): semantic injection RMS
+   exactly 0, raw retrieval 0.65, 36 commits / 0 degenerate, guard clean, checkpoint saved.
+7. **Stage-1 training launched**: `v4_stage1_20260901_r1`, 4000 steps, batch 2, A5000
+   (`v4/diagnostics/stage1_20260901_r1.log`; checkpoints every 500 under
+   `v4/checkpoints/pi05_yam_mem_v4_stage1/v4_stage1_20260901_r1`).
+
+Next:
+1. Run the battery on the trained checkpoints:
+   `.venv/bin/python scripts/v4_stage1_eval.py --params <ckpt>/params --output-dir v4/diagnostics/stage1_eval_<step>`
+   (single GPU; wait for training to finish or use another machine).
+2. Decision point on the battery gates. Only on full PASS: per-bank injection calibration,
+   then Stage 2a (oracle semantic writes) per §5/§6.
+3. Still open: dual-bank `sample_with_memory` (raises NotImplementedError until Stage 2),
+   cluster_v4 gate-pipeline clone (§6), per-bank run-identity record for calibrated pilots.
