@@ -37,6 +37,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+# The installed Arrow/native stack segfaults inside libarrow.so when OpenPI/JAX is imported
+# before PyArrow in the same process (the conftest.py-documented safe order). Import first.
+import pyarrow.parquet  # noqa: F401  isort: skip
+
 import numpy as np
 
 CONFIG_NAME = "pi05_yam_mem_v4_stage1"
@@ -159,7 +163,6 @@ class Stage1Runtime:
 
         from openpi.models import model as model_lib
         from openpi.shared import nnx_utils
-        from openpi.shared import normalize as normalize_lib
         from openpi.training import config as config_lib
         import openpi.transforms as transforms
 
@@ -179,11 +182,17 @@ class Stage1Runtime:
         model = config.model.load(params)
         model.eval()
         data_config = config.data.create(config.assets_dirs, config.model)
-        norm_stats_dir = pathlib.Path(config.assets_dirs) / data_config.repo_id
-        norm_stats = normalize_lib.load(norm_stats_dir)
-        self.norm_stats_sha256 = _sha256_file(norm_stats_dir / "norm_stats.json")
+        if data_config.norm_stats is None:
+            raise Stage1EvalError("the registered config did not resolve its pinned norm stats")
+        # Hash the exact pinned file the config loaded (the AssetsConfig override directory).
+        norm_stats_file = (
+            pathlib.Path(config.data.assets.assets_dir or config.assets_dirs)
+            / (data_config.asset_id or data_config.repo_id)
+            / "norm_stats.json"
+        )
+        self.norm_stats_sha256 = _sha256_file(norm_stats_file)
         self._data_input_transform = transforms.compose(data_config.data_transforms.inputs)
-        self._normalize = transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm)
+        self._normalize = transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm)
         self._model_transform = transforms.compose(data_config.model_transforms.inputs)
         self._probe = nnx_utils.module_jit(model.v4_fact_probe_step)
 

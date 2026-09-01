@@ -1,25 +1,23 @@
 # V4 Final Plan — Dual-Bank Visual + Semantic TTT Memory
 
-**Status:** Finalized against the real repo (branch `v4`, worktree `/iris/u/kewalk/memory_project_v4`)
+**Status:** Finalized against the real repo (standalone repository at `memory_project_v4`, branch `v4`)
 **Supersedes:** the v1.0 architecture draft (`V4_Dual_Bank_Visual_Semantic_TTT_Memory_Plan_EN.md`). All seven design invariants of the draft are preserved; §2 records the places where the implementation deliberately differs from the draft and why.
-**Non-interference contract:** `main` stays the v3 line. The running v36 pilot (`v36_pilot_20260831_r6`, iris-hgx-1, artifacts under `memory_project/v35/`) and every older run remain testable and editable in the original tree. Nothing in v4 writes into `memory_project/`, its `.venv`, or its JAX cache.
+**Non-interference contract:** the old `memory_project` tree stays the v3 line (the v36 pilot and every older run remain testable there). This repository never reads from or writes into it.
 
 ---
 
-## 1. Repo isolation (done)
+## 1. Repo isolation (done; standalone since 2026-09-01)
 
 | Item | Value |
 |---|---|
-| Branch | `v4`, branched from `main` @ `eebe2cb` (v3.5/v36 snapshot commit) |
-| Worktree | `/iris/u/kewalk/memory_project_v4` (separate checkout; `main` tree untouched) |
-| Data | `data -> /iris/u/kewalk/memory_project/data` (symlink, shared read-only) |
-| v3 artifacts | `v35_readonly -> /iris/u/kewalk/memory_project/v35` (read-only reference: v36 ckpt-0, calibrations, gate artifacts) |
-| v4 artifacts | `v4/{diagnostics,assets,checkpoints}` in the worktree (gitignored, like `v35/`) |
-| Python env | own `openpi/.venv` via `uv sync --frozen` (the v3 venv is an *editable install of the v3 tree* — sharing it would silently import v3 code) |
-| JAX cache | v4 gets its **own** `OPENPI_JAX_CACHE_DIR` (`v4/cache/jax`). Never share with the running v36: the NFS-shared cache corrupts under concurrent writers (root cause of the train_test SIGABRT flake). |
-| GPUs | v4 never runs on GPUs the v36 pilot occupies. Stage 1 is small enough for any single free GPU / the other cluster. |
+| Repository | standalone git repo, branch `v4` (full history preserved back through the v3 lineage; formerly a worktree of `memory_project`) |
+| Data | `data/` is a REAL in-repo directory (gitignored): the converted v36 LeRobot dataset (39G, byte-verified copy), every `0830_0831*` manifest JSON incl. approval ledger + inventory, and the v4 fact sidecar. Raw episode recordings deliberately stay with the old project — v4's contract is the frozen converted dataset. |
+| v4 artifacts | `v4/{diagnostics,assets,checkpoints}` (gitignored) |
+| Python env | own `openpi/.venv` via `GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen`; recreate the same way on a new cluster |
+| Caches | repo-local under `v35/cache/` (the path name is the portable runtime contract of `project_paths`): JAX cache, HF caches, and the pi05_base checkpoint cache (12G, pre-seeded). A new cluster re-downloads pi05_base automatically if absent. |
+| GPUs | Stage 1 fits a single 24G GPU (A5000-verified); later stages size like v3.5 (4x H100). |
 
-Workflow: v3 fixes happen in `memory_project/` on `main` as usual; v4 work happens only in `memory_project_v4/` on `v4`. If a shared-file fix (e.g. `memory.py`) lands on `main`, cherry-pick it into `v4`.
+Legacy note: `openpi/cluster_v34/` and some pre-v4 scripts reference the old absolute paths and raw-data workflows; they are kept as history and are inert for v4. `project_paths.SHARED_DATA_LINKS` (the symlink affordance used during the worktree phase) remains supported but unused now that `data/` is real.
 
 ---
 
