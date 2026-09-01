@@ -12,6 +12,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 v4_env_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# The login HOME on the iris cluster is a tiny-quota AFS directory; anything that defaults a
+# cache to ~ dies with "Disk quota exceeded". Every v4 launcher runs with the NFS home.
+export HOME=/iris/u/kewalk
 # shellcheck source=../cluster_v35/env.sh
 source "${v4_env_dir}/../cluster_v35/env.sh"
 
