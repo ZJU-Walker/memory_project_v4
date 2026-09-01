@@ -2445,6 +2445,9 @@ _SEQUENCE_TIME_KEYS = frozenset(
         "seq_read_credit_reachable",
         "seq_decay_gap_before",
         "seq_use_pressure_mask",
+        # v4 per-step fact observability shares the sampled-step time axis; the per-sequence
+        # seq_fact_labels ([slots], no time axis) is deliberately not listed.
+        "seq_fact_observable",
     }
 )
 

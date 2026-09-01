@@ -788,11 +788,16 @@ class Pi0(_model.BaseModel):
         return _memory.l2_normalize(self.fact_keys.value.astype(jnp.float32))
 
     @at.typecheck
+    def _v4_fact_slots(self, h8_top: at.Float[at.Array, "b n emb"]) -> at.Float[at.Array, "b f emb"]:
+        """Memory-blind per-slot features: the fact compressor's outputs on the layer-8
+        top-camera states (the representation the Stage-1 leak probes examine)."""
+        source_valid = self._v32_top_patch_valid(h8_top.shape[1])
+        return self.fact_compressor(h8_top.astype(jnp.float32), source_valid=source_valid).astype(jnp.float32)
+
+    @at.typecheck
     def v4_fact_logits(self, h8_top: at.Float[at.Array, "b n emb"]) -> at.Float[at.Array, "b f t"]:
         """Memory-blind per-slot fact logits from the layer-8 top-camera hidden states."""
-        source_valid = self._v32_top_patch_valid(h8_top.shape[1])
-        slots = self.fact_compressor(h8_top.astype(jnp.float32), source_valid=source_valid)
-        return self.fact_logit_head(slots.astype(jnp.float32)).astype(jnp.float32)
+        return self.fact_logit_head(self._v4_fact_slots(h8_top)).astype(jnp.float32)
 
     @at.typecheck
     def v4_fact_write_intent(self, fact_logits: at.Float[at.Array, "b f t"]) -> dict[str, at.Array]:
@@ -903,9 +908,11 @@ class Pi0(_model.BaseModel):
             state_token_mask=preprocessed.token_state_mask,
             semantic_state=self.memory_semantic.init_state(batch),
         )
-        fact_logits = self.v4_fact_logits(prepared["h8_top"])
+        fact_slots = self._v4_fact_slots(prepared["h8_top"])
+        fact_logits = self.fact_logit_head(fact_slots).astype(jnp.float32)
         intent = self.v4_fact_write_intent(fact_logits)
         return {
+            "fact_slots": fact_slots,
             "fact_logits": fact_logits,
             "fact_probs": intent["probs"],
             "fact_confidence": intent["confidence"],
@@ -4529,11 +4536,15 @@ class Pi0(_model.BaseModel):
                     fact_correct = (jnp.argmax(fact_logits_task, axis=-1) == fact_target).astype(jnp.float32)
 
                     # Read-side fact CE: decode each written slot's true target from the raw
-                    # pre-injection retrieval on decision steps. Per-slot runtime gating
-                    # mirrors the v3.5 read_active semantics (a slot must have committed).
+                    # pre-injection retrieval on decision steps. Gating mirrors the v3.5
+                    # read_active convention: the sampler's EXPECTED state validity (so the
+                    # accumulation path can build exact data-only denominators) AND the
+                    # runtime per-slot commit record (a slot must actually have committed).
                     fact_read_logits = self.v4_fact_read_logits(prepared["sem_retrieved"])
                     sem_read_active = (
-                        (x["decision_mask"] & transition_valid)[:, None] & sem_written & fact_label_real
+                        (x["decision_mask"] & transition_valid & x["read_state_valid"])[:, None]
+                        & sem_written
+                        & fact_label_real
                     ).astype(jnp.float32)
                     read_logp = jax.nn.log_softmax(fact_read_logits, axis=-1)
                     fact_read_ce = -jnp.take_along_axis(read_logp, fact_labels[..., None], axis=-1)[..., 0]

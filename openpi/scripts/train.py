@@ -158,12 +158,40 @@ def _log_training_identity(config: _config.TrainConfig) -> None:
         )
 
 
+V4_STAGE1_FREEZE_PATTERN = r"^(?!.*fact_).*$"
+
+
+def _is_v4_stage1_config(config: _config.TrainConfig) -> bool:
+    """True iff the run is the v4 Stage-1 fact-head-only shape (V4_PLAN.md §5).
+
+    In this shape the injection-calibration lock is vacuous rather than bypassed: every
+    parameter outside fact_* is frozen, the semantic injection gate is pinned to exact zero
+    (so the only gradient reaching fact_* is the fact CE), and the read-side fact loss is off.
+    Nothing can train through an uncalibrated injection pathway. Every condition is checked
+    fail-closed; any mismatch falls back to the full v3.5 calibration requirement.
+    """
+    model_config = config.model
+    if not getattr(model_config, "memory_v4_dual_bank", False):
+        return False
+    freeze = config.freeze_filter
+    return (
+        isinstance(freeze, nnx_utils.PathRegex)
+        and freeze.pattern.pattern == V4_STAGE1_FREEZE_PATTERN
+        and getattr(model_config, "memory_sem_injection_gate_init", None) == 0.0
+        and getattr(model_config, "memory_fact_loss_weight", 0.0) > 0.0
+        and getattr(model_config, "memory_fact_read_loss_weight", None) == 0.0
+        and config.data.base_config.memory_v4_fact_labels_path is not None
+        and config.data.base_config.memory_v4_fact_labels_sha256 is not None
+    )
+
+
 def _validate_v35_training_ready(config: _config.TrainConfig) -> None:
     """Refuse a v3.5 optimizer run whose fresh-base/calibration contract is incomplete."""
     model_config = config.model
     if not getattr(model_config, "memory_v35_enabled", False):
         return
-    if not getattr(model_config, "memory_v35_calibrated", False):
+    v4_stage1 = _is_v4_stage1_config(config)
+    if not getattr(model_config, "memory_v35_calibrated", False) and not v4_stage1:
         raise ValueError(
             "v3.5 training is locked until train-only injection calibration is frozen; set "
             "memory_v35_calibrated=True, memory_v35_calibration_id, memory_injection_c, and "
@@ -184,7 +212,8 @@ def _validate_v35_training_ready(config: _config.TrainConfig) -> None:
         raise ValueError("v3.5 exact continuation requires num_workers=0 so no batch can be prefetched.")
     if not config.data.base_config.memory_sequence_buckets:
         raise ValueError("v3.5 exact continuation requires the stateful sequence-bucket sampler.")
-    _load_and_validate_v35_calibration_artifact(config)
+    if not v4_stage1:
+        _load_and_validate_v35_calibration_artifact(config)
 
 
 def _weight_loader_for_run(config: _config.TrainConfig) -> _weight_loaders.WeightLoader:
@@ -199,30 +228,52 @@ def _weight_loader_for_run(config: _config.TrainConfig) -> _weight_loaders.Weigh
 
 
 def _cast_frozen_params(config: _config.TrainConfig, params: nnx.State) -> nnx.State:
-    """Cast ordinary frozen leaves to BF16 while keeping the v3.5 gate exactly FP32."""
+    """Cast ordinary frozen leaves to BF16 while keeping the v3.5 gate exactly FP32.
+
+    Flax keeps disabled optional submodules (e.g. gemma bias slots) as literal None leaves.
+    The narrow v3.x freeze filters never matched one, but a broad filter such as the v4
+    Stage-1 freeze-everything-but-fact regex does, so the cast must pass None through.
+    """
     cast_filter = config.freeze_filter
     if getattr(config.model, "memory_v35_enabled", False):
         cast_filter = nnx.All(cast_filter, nnx.Not(MEMORY_INJECT_GATE_FILTER))
-    return nnx_utils.state_map(params, cast_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+    return nnx_utils.state_map(
+        params, cast_filter, lambda p: p if p.value is None else p.replace(p.value.astype(jnp.bfloat16))
+    )
 
 
 def _validate_v35_initialized_gate(config: _config.TrainConfig, params: nnx.State) -> None:
-    """Fail closed unless the initialized v3.5 injection gate matches calibration exactly."""
+    """Fail closed unless every initialized injection gate matches its configured value.
+
+    v3.x models carry exactly one gate (memory_inject_w); v4 dual-bank models add the
+    semantic gate (memory_sem_inject_w), validated against its own configured init.
+    """
     if not getattr(config.model, "memory_v35_enabled", False):
         return
     gate_leaves = params.filter(MEMORY_INJECT_GATE_FILTER).flat_state()
-    if len(gate_leaves) != 1:
-        raise ValueError(f"v3.5 expected exactly one memory_inject_w leaf, found {len(gate_leaves)}.")
-    gate_w = np.asarray(jax.device_get(next(iter(gate_leaves.values())).value))
-    if gate_w.dtype != np.float32:
-        raise ValueError(f"v3.5 memory_inject_w must remain float32, got {gate_w.dtype}.")
-    expected = np.float32(getattr(config.model, "memory_injection_gate_init", 0.5))
-    effective = np.tanh(gate_w.astype(np.float32)).astype(np.float32)
-    if not np.all(np.isfinite(effective)) or not np.allclose(effective, expected, rtol=0.0, atol=1e-6):
-        raise ValueError(
-            "v3.5 memory_inject_w does not match the frozen calibrated gate: "
-            f"expected tanh(w)={expected}, observed range=[{effective.min()}, {effective.max()}]."
+    v4_on = getattr(config.model, "memory_v4_dual_bank", False)
+    expected_count = 2 if v4_on else 1
+    if len(gate_leaves) != expected_count:
+        raise ValueError(f"expected exactly {expected_count} injection-gate leaves, found {len(gate_leaves)}.")
+    for path, leaf in gate_leaves.items():
+        path_str = "/".join(str(part) for part in path)
+        is_semantic = "memory_sem_inject_w" in path_str
+        if is_semantic and not v4_on:
+            raise ValueError(f"unexpected semantic injection gate on a non-v4 model: {path_str}.")
+        gate_w = np.asarray(jax.device_get(leaf.value))
+        if gate_w.dtype != np.float32:
+            raise ValueError(f"injection gate {path_str} must remain float32, got {gate_w.dtype}.")
+        expected = np.float32(
+            getattr(config.model, "memory_sem_injection_gate_init", 0.5)
+            if is_semantic
+            else getattr(config.model, "memory_injection_gate_init", 0.5)
         )
+        effective = np.tanh(gate_w.astype(np.float32)).astype(np.float32)
+        if not np.all(np.isfinite(effective)) or not np.allclose(effective, expected, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"injection gate {path_str} does not match its frozen configured value: "
+                f"expected tanh(w)={expected}, observed range=[{effective.min()}, {effective.max()}]."
+            )
 
 
 def _canonical_json(value: Any) -> str:
@@ -600,6 +651,16 @@ def _write_v35_initialization_identity(config: _config.TrainConfig, params: nnx.
     """Bind official source provenance and the actual post-cast step-0 tree to this run."""
     if not getattr(config.model, "memory_v35_enabled", False):
         return None
+    if _is_v4_stage1_config(config):
+        # Stage-1 has no calibration artifact by construction (nothing trains through any
+        # injection). The audited graft manifest is still written by the loader; the sealed
+        # v3.5 run-identity record is deferred to the calibrated v4 pilot (V4_PLAN.md §6).
+        return None
+    if getattr(config.model, "memory_v4_dual_bank", False):
+        # A calibrated v4 pilot has TWO gate leaves; the single-gate identity record below
+        # would silently bind an arbitrary one. Per-bank identity lands with the v4 gate
+        # pipeline (V4_PLAN.md §6).
+        raise NotImplementedError("v4 dual-bank run identity requires the per-bank calibration record.")
     checkpoint_dir = pathlib.Path(config.checkpoint_dir)
     graft_path = checkpoint_dir / "initialization_graft_manifest.json"
     if not graft_path.is_file():
@@ -1085,6 +1146,30 @@ def _v35_cell_macro_ce(cell_ce_sum: at.Array, cell_episode_count: at.Array) -> a
     return jnp.sum(per_cell) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
 
 
+def _v4_fact_info(chunked_loss: dict[str, at.Array]) -> dict[str, at.Array]:
+    """v4 fact-supervision numerators/denominators and semantic-bank telemetry, kept raw for
+    exact logging-window pooling (the v3.5 convention)."""
+    info = {}
+    for key in (
+        "v4_fact_ce_class_sum",
+        "v4_fact_count_class",
+        "v4_fact_correct_class",
+        "v4_fact_read_ce_sum",
+        "v4_fact_read_count",
+        "v4_fact_read_correct",
+        "v4_sem_commit_count",
+        "v4_sem_write_eligible_count",
+        "v4_sem_degenerate_count",
+        "v4_sem_final_residual_sum",
+        "v4_sem_final_residual_max",
+        "v4_sem_raw_read_rms_sum",
+        "v4_sem_injected_pre_cast_rms_sum",
+        "v4_sem_injected_post_cast_rms_sum",
+    ):
+        info[f"diagnostic/{key}"] = chunked_loss[key]
+    return info
+
+
 def _v35_loss_info(chunked_loss: dict[str, at.Array]) -> dict[str, at.Array]:
     """Keep v3.5 numerators and denominators explicit for exact logging-window pooling."""
     info = {}
@@ -1292,7 +1377,9 @@ LADDER_PROBE_FILTER = nnx_utils.PathRegex(r".*ladder_(writer|read)_head.*")
 # memory_gate, memory_aux_*, memory_slot_embedding, state_null_embedding). Used by the
 # optional `memory_grad_clip` group pre-clip in train_step.
 MEMORY_PATH_FILTER = nnx_utils.PathRegex(r".*(memory|query_compressor|query_conditioner|state_null_embedding).*")
-MEMORY_INJECT_GATE_FILTER = nnx_utils.PathRegex(r".*memory_inject_w.*")
+# Covers the visual gate (memory_inject_w) and the v4 semantic gate (memory_sem_inject_w):
+# both are calibrated FP32 quantities that must never be silently cast with the frozen bulk.
+MEMORY_INJECT_GATE_FILTER = nnx_utils.PathRegex(r".*memory_(sem_)?inject_w.*")
 
 
 def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
@@ -1490,7 +1577,15 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(_weight_loader_for_run(config), train_state_shape.params.to_pure_dict())
+    # The audited loader grafts against the model's NATIVE (pre-freeze-cast) dtypes: sources
+    # are FP32 and audited grafts never cast silently. Inside `init` the graft happens before
+    # `_cast_frozen_params`, so the loader must see the same pre-cast tree. For every v3.x
+    # config the two specs coincide (grafted leaves were never frozen); the v4 Stage-1
+    # freeze-almost-everything filter is where they diverge.
+    uncast_params_shape = jax.eval_shape(
+        lambda rng: nnx.state(config.model.create(jax.random.split(rng)[1])), init_rng
+    )
+    partial_params = _load_weights_and_validate(_weight_loader_for_run(config), uncast_params_shape.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
@@ -1583,6 +1678,19 @@ def train_step(
                 info["v35_write_side_loss"] = write_side_loss
                 info["v35_read_side_loss"] = read_side_loss
                 info.update(_v35_loss_info(chunked_loss))
+            if "v4_fact_ce_class_sum" in chunked_loss:
+                # v4 (V4_PLAN.md): class-balanced macro fact CE (the `unknown` abstention rows
+                # vastly outnumber the real targets) plus the read-side fact CE over the
+                # runtime-gated decode terms.
+                fact_loss = _aux_macro_ce(chunked_loss["v4_fact_ce_class_sum"], chunked_loss["v4_fact_count_class"])
+                fact_read_loss = chunked_loss["v4_fact_read_ce_sum"] / jnp.maximum(
+                    chunked_loss["v4_fact_read_count"], 1.0
+                )
+                loss += model.memory_fact_loss_weight * fact_loss
+                loss += model.memory_fact_read_loss_weight * fact_read_loss
+                info["v4_fact_loss"] = fact_loss
+                info["v4_fact_read_loss"] = fact_read_loss
+                info.update(_v4_fact_info(chunked_loss))
             if "ladder_writer_ce_sum" in chunked_loss:
                 # Section 6 online rungs: features are stop-gradient'ed inside the model, so
                 # this term reaches ONLY the ladder heads -- whose grads train_step removes
@@ -1680,6 +1788,41 @@ def train_step(
                 "write": episode_count_by_cell(write_episode),
                 "read": episode_count_by_cell(read_episode),
             }
+        v4_fact_count_global = None
+        if getattr(config.model, "memory_v4_dual_bank", False):
+            if observation.seq_fact_labels is None or observation.seq_fact_observable is None:
+                raise ValueError("v4 accumulation requires seq_fact_labels and seq_fact_observable.")
+            num_fact_targets = config.model.memory_fact_targets
+            unknown_class = num_fact_targets - 1
+            raw_labels = observation.seq_fact_labels
+            fact_labels = jnp.clip(raw_labels, 0, num_fact_targets - 1)
+            label_real = (raw_labels >= 0) & (raw_labels < num_fact_targets) & (fact_labels != unknown_class)
+            # Reproduce the model's per-step supervision selection with data-only fields
+            # (transition_valid = step valid & non-negative gap, exactly as in the model).
+            transition_valid = observation.seq_step_mask & (observation.seq_decay_gap_before >= 0)
+            observable = observation.seq_fact_observable & transition_valid[..., None]
+            supervise_true = observable & jnp.expand_dims(label_real, axis=-2)
+            supervise_unknown = (
+                jnp.expand_dims(observation.seq_decision_mask & transition_valid, axis=-1) & ~observable
+            )
+            target = jnp.where(supervise_true, jnp.expand_dims(fact_labels, axis=-2), unknown_class)
+            active = (supervise_true | supervise_unknown).astype(jnp.float32)
+            target_onehot = jax.nn.one_hot(target, num_fact_targets, dtype=jnp.float32)
+            v4_fact_count_global = {
+                "class": jnp.sum(target_onehot * active[..., None], axis=tuple(range(target.ndim))),
+                # Expected read denominator (the model gates its numerator on the same
+                # expected mask AND the runtime commit record; shortfalls surface in the
+                # v4_sem_degenerate/commit telemetry rather than skewing the objective).
+                "read": jnp.sum(
+                    (
+                        jnp.expand_dims(
+                            observation.seq_decision_mask & transition_valid & observation.seq_read_state_valid,
+                            axis=-1,
+                        )
+                        & jnp.expand_dims(label_real, axis=-2)
+                    ).astype(jnp.float32)
+                ),
+            }
 
         def microbatch_loss_fn(model, rng, micro_observation, micro_actions):
             chunked_loss = model.compute_loss(rng, micro_observation, micro_actions, train=True)
@@ -1757,6 +1900,23 @@ def train_step(
                 info["v35_write_side_loss"] = write_side_loss
                 info["v35_read_side_loss"] = read_side_loss
                 info.update(_v35_loss_info(chunked_loss))
+            if "v4_fact_ce_class_sum" in chunked_loss:
+                if v4_fact_count_global is None:
+                    raise ValueError("v4 fact losses require global effective-batch fact counts.")
+                class_count = v4_fact_count_global["class"]
+                present = class_count > 0
+                per_class = jnp.where(
+                    present, chunked_loss["v4_fact_ce_class_sum"] / jnp.maximum(class_count, 1.0), 0.0
+                )
+                fact_contrib = jnp.sum(per_class) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
+                fact_read_contrib = chunked_loss["v4_fact_read_ce_sum"] / jnp.maximum(
+                    v4_fact_count_global["read"], 1.0
+                )
+                loss += model.memory_fact_loss_weight * fact_contrib
+                loss += model.memory_fact_read_loss_weight * fact_read_contrib
+                info["v4_fact_loss"] = fact_contrib  # additive: sums to the exact global macro CE
+                info["v4_fact_read_loss"] = fact_read_contrib
+                info.update(_v4_fact_info(chunked_loss))
             if "ladder_writer_ce_sum" in chunked_loss:
                 if ladder_count_global is None:
                     raise ValueError("ladder probe losses require the seq_side/evidence/waiting fields.")
@@ -1985,7 +2145,12 @@ def main(config: _config.TrainConfig):
     _log_training_identity(config)
 
     _validate_v35_training_ready(config)
-    v35_enabled = getattr(config.model, "memory_v35_enabled", False)
+    # Host-side v3.5 machinery (pilot authorization, bootstrap-0 resume, sealed provenance,
+    # cumulative telemetry) applies to calibrated pilot runs. The v4 Stage-1 fact-head-only
+    # shape trains as an ordinary run: nothing optimizes through any injection, so there is no
+    # calibrated pathway to seal. The device-side runtime accounting guard stays active for
+    # every memory_v35_enabled model, Stage-1 included.
+    v35_enabled = getattr(config.model, "memory_v35_enabled", False) and not _is_v4_stage1_config(config)
     v35_pilot_authorization: _v35_authorization.AuthorizationRecord | None = None
     if v35_enabled:
         v35_pilot_authorization = _v35_authorization.load_and_validate_pilot_authorization(config)
@@ -2242,7 +2407,10 @@ def main(config: _config.TrainConfig):
         metric_step, should_save, checkpoint_step = _step_labels_and_save_decision(
             config, loop_step=step, start_step=start_step
         )
-        if v35_runtime_guard:
+        # The sealed cumulative-telemetry ledger belongs to the host-side v3.5 protocol
+        # (v35_enabled); the device-side runtime guard above also covers v4 Stage-1, which
+        # checkpoints through the ordinary path.
+        if v35_enabled:
             if v35_cumulative_telemetry is None:
                 raise AssertionError("v3.5 accepted update is missing its cumulative telemetry ledger.")
             _accumulate_v35_cumulative_telemetry(
@@ -2267,7 +2435,7 @@ def main(config: _config.TrainConfig):
 
         # Save v3.5 at the accepted-update boundary before drawing another batch. Since the
         # loader has no workers/prefetch, its snapshotted RNG points exactly to the next batch.
-        if should_save and v35_runtime_guard:
+        if should_save and v35_enabled:
             _checkpoints.save_state(
                 checkpoint_manager,
                 train_state,
@@ -2276,9 +2444,9 @@ def main(config: _config.TrainConfig):
                 provenance_assets=v35_provenance_assets,
                 v35_cumulative_telemetry=v35_cumulative_telemetry,
             )
-        if not v35_runtime_guard or metric_step < config.num_train_steps:
+        if not v35_enabled or metric_step < config.num_train_steps:
             batch = next(data_iter)
-        if should_save and not v35_runtime_guard:
+        if should_save and not v35_enabled:
             # Preserve legacy ordering, which historically fetched the next batch before save.
             _checkpoints.save_state(
                 checkpoint_manager,
