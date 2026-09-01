@@ -103,6 +103,7 @@ class _TinyV4(nnx.Module):
     """The v4 semantic surface on a 64-wide stand-in (the _TinyV32 pattern)."""
 
     v4_fact_keys = pi0.Pi0.v4_fact_keys
+    _v4_fact_slots = pi0.Pi0._v4_fact_slots
     v4_fact_logits = pi0.Pi0.v4_fact_logits
     v4_fact_write_intent = pi0.Pi0.v4_fact_write_intent
     v4_semantic_write = pi0.Pi0.v4_semantic_write
@@ -201,6 +202,7 @@ class _TinyV4Seq(_TinyV35):
 
     _memory_token_total = pi0.Pi0._memory_token_total
     v4_fact_keys = pi0.Pi0.v4_fact_keys
+    _v4_fact_slots = pi0.Pi0._v4_fact_slots
     v4_fact_logits = pi0.Pi0.v4_fact_logits
     v4_fact_write_intent = pi0.Pi0.v4_fact_write_intent
     v4_semantic_write = pi0.Pi0.v4_semantic_write
@@ -289,8 +291,9 @@ def test_v4_sequence_commits_confident_slots_supervises_facts_and_reads_back(tin
     np.testing.assert_array_equal(losses["v4_sem_degenerate_count"], 0.0)
 
     # Fact supervision: true targets for slots 0/1 on the E step (classes 0 and 1), the
-    # mandatory `unknown` abstention for all 3 slots on the D step (class 2).
-    np.testing.assert_array_equal(losses["v4_fact_count_class"], jnp.asarray([1.0, 1.0, 3.0]))
+    # mandatory `unknown` abstention on every other valid (step, slot) pair: 3 steps x 3
+    # slots minus the 2 observable rows = 7.
+    np.testing.assert_array_equal(losses["v4_fact_count_class"], jnp.asarray([1.0, 1.0, 7.0]))
     # Read-side supervision: the two real slots, written and decodable on the D step.
     np.testing.assert_array_equal(losses["v4_fact_read_count"], 2.0)
 

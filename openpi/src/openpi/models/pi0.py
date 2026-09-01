@@ -4524,11 +4524,15 @@ class Pi0(_model.BaseModel):
                 if v4_on:
                     transition_validf = transition_valid.astype(jnp.float32)
                     # Write-side (Stage-1) fact CE: the true target on observable frames; the
-                    # mandatory `unknown` abstention on decision frames, where a memory-blind
-                    # head that still "knows" is by definition leaking through pose/state.
+                    # mandatory `unknown` abstention on EVERY other valid step (draft §7:
+                    # unclear evidence => unknown). Restricting abstention to decision steps
+                    # (the original form) left the pre-evidence frames unsupervised entirely,
+                    # measured as 0.59 abstention there at ckpt-1000 while decision-step
+                    # abstention was 1.0. The class-balanced macro CE keeps the abundant
+                    # unknown rows from drowning the real targets.
                     observable = x["fact_observable"] & transition_valid[:, None]
                     supervise_true = observable & fact_label_real
-                    supervise_unknown = (x["decision_mask"] & transition_valid)[:, None] & ~observable
+                    supervise_unknown = transition_valid[:, None] & ~observable
                     fact_target = jnp.where(supervise_true, fact_labels, unknown_class)
                     fact_active = (supervise_true | supervise_unknown).astype(jnp.float32)
                     fact_logp = jax.nn.log_softmax(fact_logits_task, axis=-1)

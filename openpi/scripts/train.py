@@ -1802,9 +1802,7 @@ def train_step(
             transition_valid = observation.seq_step_mask & (observation.seq_decay_gap_before >= 0)
             observable = observation.seq_fact_observable & transition_valid[..., None]
             supervise_true = observable & jnp.expand_dims(label_real, axis=-2)
-            supervise_unknown = (
-                jnp.expand_dims(observation.seq_decision_mask & transition_valid, axis=-1) & ~observable
-            )
+            supervise_unknown = jnp.expand_dims(transition_valid, axis=-1) & ~observable
             target = jnp.where(supervise_true, jnp.expand_dims(fact_labels, axis=-2), unknown_class)
             active = (supervise_true | supervise_unknown).astype(jnp.float32)
             target_onehot = jax.nn.one_hot(target, num_fact_targets, dtype=jnp.float32)

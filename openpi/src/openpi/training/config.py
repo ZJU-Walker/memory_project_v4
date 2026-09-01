@@ -2132,9 +2132,13 @@ _CONFIGS = [
                 freeze_filter=nnx_utils.PathRegex(r"^(?!.*fact_).*$"),
                 batch_size=4,
                 gradient_accumulation_steps=1,
+                # 3e-4: only the fresh fact compressor/head train (AdamW, clip 1.0), and the
+                # discriminative signal is sparse (~2-3 observable E rows per sequence). At
+                # 1e-4 the r1 run learned phase abstention but left evidence accuracy at
+                # chance through 1000 updates.
                 lr_schedule=_optimizer.CosineDecaySchedule(
                     warmup_steps=100,
-                    peak_lr=1e-4,
+                    peak_lr=3e-4,
                     decay_steps=4_000,
                     decay_lr=1e-5,
                 ),
