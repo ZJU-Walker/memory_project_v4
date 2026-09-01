@@ -229,6 +229,12 @@ def _apply_v4_graft_sources(
             if path not in expected:
                 raise ValueError(f"v4 graft leaf {joined!r} from {params_path} does not exist in the model.")
             spec = expected[path]
+            # Flax keeps disabled optional submodules (e.g. bias-free Linear biases) as
+            # literal None leaves on both sides; they carry nothing to graft.
+            if value is None or spec is None:
+                if (value is None) != (spec is None):
+                    raise ValueError(f"v4 graft leaf {joined!r}: None on one side only (structural mismatch).")
+                continue
             if tuple(value.shape) != tuple(spec.shape) or np.dtype(value.dtype) != np.dtype(spec.dtype):
                 raise ValueError(
                     f"v4 graft leaf {joined!r}: source {value.shape}/{value.dtype} vs model "
