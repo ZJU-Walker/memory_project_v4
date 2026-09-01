@@ -301,20 +301,56 @@ def _fold_of_episode(stable_ids: Sequence[str]) -> dict[str, int]:
     return {sid: index % OOF_FOLDS for index, sid in enumerate(ranked)}
 
 
-def _ridge_oof_scores(features: np.ndarray, labels: np.ndarray, folds: np.ndarray) -> np.ndarray:
-    scores = np.zeros(len(labels), dtype=np.float64)
+@dataclasses.dataclass(frozen=True)
+class _PreparedFold:
+    """Per-fold dual-ridge factorization, label-independent (the Gate-B reuse pattern).
+
+    The slot features are wide (fact_slots x width = 16k dims), so the primal normal
+    equations are infeasible; the dual form needs only the n_train x n_train kernel, and its
+    Cholesky factor is reused across every label permutation -- each permutation costs two
+    triangular solves and one matvec instead of a fresh factorization.
+    """
+
+    test_index: np.ndarray
+    train_index: np.ndarray
+    cho_factor: tuple[np.ndarray, bool]
+    cross_kernel: np.ndarray  # [n_test, n_train] = X_test @ X_train.T
+
+
+def _prepare_ridge_folds(features: np.ndarray, folds: np.ndarray) -> tuple[_PreparedFold, ...]:
+    import scipy.linalg
+
     x = features.astype(np.float64)
     x = (x - x.mean(axis=0)) / np.maximum(x.std(axis=0), 1e-6)
-    y = labels.astype(np.float64) * 2.0 - 1.0
+    prepared = []
     for fold in np.unique(folds):
         test = folds == fold
         train = ~test
-        if not np.any(test) or len(np.unique(labels[train])) < 2:
-            raise Stage1EvalError("degenerate OOF fold (missing class or empty test)")
+        if not np.any(test) or not np.any(train):
+            raise Stage1EvalError("degenerate OOF fold (empty train or test)")
         xt = x[train]
-        gram = xt.T @ xt + RIDGE_LAMBDA * np.eye(x.shape[1])
-        weights = np.linalg.solve(gram, xt.T @ y[train])
-        scores[test] = x[test] @ weights
+        kernel = xt @ xt.T + RIDGE_LAMBDA * np.eye(xt.shape[0])
+        prepared.append(
+            _PreparedFold(
+                test_index=np.nonzero(test)[0],
+                train_index=np.nonzero(train)[0],
+                cho_factor=scipy.linalg.cho_factor(kernel),
+                cross_kernel=x[test] @ xt.T,
+            )
+        )
+    return tuple(prepared)
+
+
+def _prepared_oof_scores(prepared: Sequence[_PreparedFold], labels: np.ndarray) -> np.ndarray:
+    import scipy.linalg
+
+    scores = np.zeros(len(labels), dtype=np.float64)
+    y = labels.astype(np.float64) * 2.0 - 1.0
+    for fold in prepared:
+        if len(np.unique(labels[fold.train_index])) < 2:
+            raise Stage1EvalError("degenerate OOF fold (missing class in train)")
+        alpha = scipy.linalg.cho_solve(fold.cho_factor, y[fold.train_index])
+        scores[fold.test_index] = fold.cross_kernel @ alpha
     return scores
 
 
@@ -347,7 +383,8 @@ def leak_probe(
     stable = np.asarray(episode_ids)
     fold_map = _fold_of_episode([str(x) for x in stable])
     folds = np.asarray([fold_map[str(x)] for x in stable], dtype=np.int64)
-    observed = _episode_balanced_accuracy(_ridge_oof_scores(features, labels, folds), labels, stable)
+    prepared = _prepare_ridge_folds(features, folds)
+    observed = _episode_balanced_accuracy(_prepared_oof_scores(prepared, labels), labels, stable)
     rng = np.random.default_rng(PERMUTATION_SEED)
     episode_order = sorted({str(x) for x in stable})
     episode_label = {str(sid): int(labels[stable == sid][0]) for sid in episode_order}
@@ -366,7 +403,7 @@ def leak_probe(
             null[index] = 0.5
             continue
         null[index] = _episode_balanced_accuracy(
-            _ridge_oof_scores(features, permuted_labels, folds), permuted_labels, stable
+            _prepared_oof_scores(prepared, permuted_labels), permuted_labels, stable
         )
     p_value = float((np.sum(null >= observed) + 1) / (PERMUTATIONS + 1))
     return {
