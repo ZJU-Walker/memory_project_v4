@@ -173,6 +173,7 @@ def memory_readout(result: dict, names: _Names) -> tuple[str, str]:
     confidence = result.get("fact_confidence") or []
     read = result.get("read_predicted") or []
     commit_now = result.get("sem_commit_now") or []
+    written = result.get("sem_written")  # None on older servers: show every slot
     unknown = len(names.targets) - 1
     seen = []
     for i, (p, c) in enumerate(zip(predicted, confidence, strict=False)):
@@ -184,7 +185,8 @@ def memory_readout(result: dict, names: _Names) -> tuple[str, str]:
     for i, r in enumerate(read):
         if i >= len(names.slots):
             break
-        held.append(f"{names.slot(i)}={names.target(int(r)) if int(r) != unknown else '-'}")
+        blank = int(r) == unknown or (written is not None and i < len(written) and not written[i])
+        held.append(f"{names.slot(i)}={'-' if blank else names.target(int(r))}")
     line_seen = "sees: " + (" ".join(seen) if seen else "n/a") + "  (* = committed now)"
     line_held = f"bank: {' '.join(held) if held else 'n/a'}  commits {result.get('sem_commits', 0)}"
     return line_seen, line_held

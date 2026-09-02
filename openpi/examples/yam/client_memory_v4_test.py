@@ -86,6 +86,10 @@ def test_memory_readout_names_slots_targets_and_commits():
     assert seen == "sees: banana=left(0.97)* grey pepper box=?(0.50)  (* = committed now)"
     assert held == "bank: banana=left grey pepper box=right  commits 3"
 
+    # A never-written slot is blanked even if the read head's argmax names a side.
+    _, held = client.memory_readout({**result, "sem_written": [True, False, False, False]}, names)
+    assert held == "bank: banana=left grey pepper box=-  commits 3"
+
 
 def test_memory_readout_falls_back_to_default_names():
     names = client._Names({})  # noqa: SLF001

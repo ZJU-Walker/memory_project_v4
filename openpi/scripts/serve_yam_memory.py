@@ -193,6 +193,7 @@ class MemoryPolicy(_policy.Policy):
         self._semantic_state = self._init_semantic_state() if self._v4 else None
         self._writes = 0
         self._sem_commits = 0
+        self._sem_written = np.zeros(int(getattr(model, "memory_fact_slots", 0)), dtype=bool)
 
     @staticmethod
     def _integer_scalar(value: Any, *, name: str) -> int:
@@ -270,6 +271,7 @@ class MemoryPolicy(_policy.Policy):
                     self._semantic_state = self._init_semantic_state()
                 self._writes = 0
                 self._sem_commits = 0
+                self._sem_written[:] = False
             logging.info("memory reset")
             if "observation/image" not in inputs:  # bare reset ping
                 return {"reset": True, "writes": 0, "sem_commits": 0}
@@ -306,6 +308,9 @@ class MemoryPolicy(_policy.Policy):
                 self._semantic_state = aux["v4_semantic_state"]
                 commit_now = np.asarray(aux["v4_sem_commit_applied"])[0].astype(bool)
                 self._sem_commits += int(commit_now.sum())
+                # Read side reports the bank BEFORE this transition, so snapshot before |=.
+                sem_written = self._sem_written.copy()
+                self._sem_written |= commit_now
             if self._v35:
                 self._writes += int(np.asarray(aux["write_occurred"])[0])
             else:
@@ -335,6 +340,9 @@ class MemoryPolicy(_policy.Policy):
             outputs["fact_confidence"] = np.asarray(aux["v4_fact_confidence"])[0].astype(float).tolist()
             outputs["sem_commit_now"] = commit_now.tolist()
             outputs["sem_commits"] = sem_commits
+            # Slots that have committed at least once since the reset: the read head's decode
+            # of a never-written slot is a bias artefact and the client blanks it.
+            outputs["sem_written"] = sem_written.tolist()
             read_logits = np.asarray(aux["v4_fact_read_logits"])[0]
             outputs["read_predicted"] = np.argmax(read_logits, axis=-1).astype(int).tolist()
             outputs["sem_injected_rms"] = float(np.asarray(aux["v4_sem_injected_pre_cast_rms"])[0])
@@ -354,7 +362,8 @@ def create_policy(args: Args) -> MemoryPolicy:
 
     memory_architecture = str(getattr(train_config.model, "memory_architecture", "v3_v31"))
     memory_write_source = str(getattr(train_config.model, "memory_write_source", "raw_hidden"))
-    if getattr(model, "memory_gate", None) is not None:
+    if getattr(model, "memory_inject_w", None) is None:
+        # v3/v3.1 content gate; under tanh_rms (v3.4+) memory_gate stays zero and is unused.
         gate = np.asarray(model.memory_gate.value)
         gate_note = (
             f"memory_gate norm {np.linalg.norm(gate):.4f} max|g| {np.abs(gate).max():.5f} (0 = memory content unused)"
