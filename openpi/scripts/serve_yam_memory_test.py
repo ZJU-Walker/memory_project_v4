@@ -136,7 +136,7 @@ def test_server_metadata_exposes_v31_config_and_write_source() -> None:
 
     metadata = serve_yam_memory._build_server_metadata(train_config, data_config, simulated_delay=6)
 
-    assert metadata == {
+    expected = {
         "config_name": "pi05_yam_mem_v31",
         "memory_architecture": "v3_v31",
         "memory_write_source": "post_attention",
@@ -147,7 +147,17 @@ def test_server_metadata_exposes_v31_config_and_write_source() -> None:
         "rtc_delay_semantics": "inclusive_max",
         "memory_stride_frames": 10,
         "custom": "kept",
+        # v3.5 / v4 fields are null for a legacy checkpoint; every request writes.
+        "memory_v35_enabled": False,
+        "memory_v4_dual_bank": False,
+        "memory_fact_slots": None,
+        "memory_fact_targets": None,
+        "memory_fact_write_conf": None,
+        "fact_slot_names": None,
+        "fact_target_names": None,
+        "write_policy": "every_request",
     }
+    assert metadata == expected
 
 
 def test_server_metadata_marks_legacy_write_source_and_disabled_rtc() -> None:
@@ -186,6 +196,64 @@ def test_server_metadata_exposes_v32_dual_query_contract() -> None:
     assert metadata["memory_query_tokens"] == 16
     assert metadata["rtc_enabled"] is True
     assert metadata["rtc_max_delay"] == 6
+
+
+def test_server_metadata_exposes_v4_dual_bank_contract() -> None:
+    train_config = types.SimpleNamespace(
+        name="pi05_yam_mem_v4_stage4c",
+        model=types.SimpleNamespace(
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            action_horizon=50,
+            memory_v35_enabled=True,
+            memory_v4_dual_bank=True,
+            memory_fact_slots=8,
+            memory_fact_targets=3,
+            memory_fact_write_conf=0.9,
+        ),
+        policy_metadata=None,
+    )
+    metadata = serve_yam_memory._build_server_metadata(
+        train_config,
+        types.SimpleNamespace(memory_stride_frames=15),
+        simulated_delay=6,
+        write_policy="always",
+        fact_names={"slots": ["banana", "grey_pepper_box"], "targets": ["left_bin", "right_bin", "unknown"]},
+    )
+    assert metadata["memory_v35_enabled"] is True
+    assert metadata["memory_v4_dual_bank"] is True
+    assert metadata["memory_fact_slots"] == 8
+    assert metadata["memory_fact_targets"] == 3
+    assert metadata["memory_fact_write_conf"] == 0.9
+    assert metadata["fact_slot_names"] == ["banana", "grey_pepper_box"]
+    assert metadata["fact_target_names"] == ["left_bin", "right_bin", "unknown"]
+    assert metadata["write_policy"] == "always"
+    assert metadata["memory_stride_frames"] == 15
+
+    # A v3.1 checkpoint has no clock: every request writes, and the v4 fields are null.
+    legacy = serve_yam_memory._build_server_metadata(
+        types.SimpleNamespace(
+            name="pi05_yam_mem_v31", model=types.SimpleNamespace(action_horizon=50), policy_metadata=None
+        ),
+        types.SimpleNamespace(memory_stride_frames=10),
+        simulated_delay=6,
+    )
+    assert legacy["write_policy"] == "every_request"
+    assert legacy["memory_v4_dual_bank"] is False
+    assert legacy["fact_slot_names"] is None
+
+
+def test_resolve_write_mask_follows_policy_and_pops_client_flag() -> None:
+    inputs = {"memory_write": False, "prompt": "find the banana"}
+    assert serve_yam_memory._resolve_write_mask(inputs, "always") is True
+    assert "memory_write" not in inputs  # consumed, never reaches the transforms
+
+    assert serve_yam_memory._resolve_write_mask({"memory_write": True}, "client") is True
+    assert serve_yam_memory._resolve_write_mask({"memory_write": False}, "client") is False
+    assert serve_yam_memory._resolve_write_mask({}, "client") is False  # fail closed
+    with pytest.raises(ValueError, match="write_policy"):
+        serve_yam_memory._resolve_write_mask({}, "sometimes")
 
 
 def test_prepare_action_prefix_transforms_and_batches_without_mutating_request() -> None:

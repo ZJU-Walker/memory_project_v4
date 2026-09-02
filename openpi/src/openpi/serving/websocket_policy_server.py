@@ -58,7 +58,11 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                # Run inference off the event loop: a cold JIT compile or a slow step must not
+                # stall the websocket keepalive pings (the August-11 robot trial died of exactly
+                # that: the client's ping timeout closed the connection mid-compile). Requests
+                # are still handled one at a time per connection.
+                action = await asyncio.to_thread(self._policy.infer, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

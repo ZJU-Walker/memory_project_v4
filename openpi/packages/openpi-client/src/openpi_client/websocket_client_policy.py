@@ -15,7 +15,16 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: Optional[int] = None,
+        api_key: Optional[str] = None,
+        ping_timeout: Optional[float] = None,
+    ) -> None:
+        """``ping_timeout`` (seconds) overrides the websockets keepalive timeout (library default
+        20 s). A server that compiles on its first request can stay silent longer than that; pass a
+        generous value (e.g. 600) for memory-policy servers that were not warmed up."""
         if host.startswith("ws"):
             self._uri = host
         else:
@@ -24,6 +33,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             self._uri += f":{port}"
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
+        self._ping_timeout = ping_timeout
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -34,8 +44,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         while True:
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                extra = {} if self._ping_timeout is None else {"ping_timeout": self._ping_timeout}
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri, compression=None, max_size=None, additional_headers=headers, **extra
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
