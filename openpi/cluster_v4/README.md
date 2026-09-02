@@ -213,10 +213,16 @@ the flag off (default). Verification on the real model: `v4/diagnostics/memory_g
 (per-leaf memory-group gradient norms, mask off vs on, ckpt-250 + dev batch) must report a
 finite group norm with the mask on before r3 launches. Stage-1's artifact is unaffected
 (the fact head reads h8 before the memory tokens; its gates never touched the late blocks).
-r3 recipe: GPUs 2+3 (`CUDA_VISIBLE_DEVICES=2,3 --fsdp-devices 2 --batch-size 4`, batch 2
-per device), exp `v4_stage2a_20260901_r3`, log `v4/diagnostics/stage2a_20260901_r3.log`;
-health signal = `memory_grad_norm` finite and `v4_fact_read_loss` falling below ln(3) by
-step ~200.
+Verified on the real ckpt-250 + dev batch (`v4/diagnostics/memory_group_grad_probe_2a_r2_250.log`,
+train mode, 19 trainable memory-group leaves): mask off -> group norm **inf** (both slot
+embeddings inf; the semantic core reads 0 because its state-cotangent clip saw the inf);
+mask on -> group norm **1.32**: semantic core m0 w0/w1/w2 0.45-0.64, read head 0.15/0.12,
+semantic slot embedding 0.05 (from the post-commit live slots), visual slot embedding
+exactly 0 (never attended). CE moves 4.112 -> 4.132 (the zero-K/V softmax sink is gone).
+**r3 launched 2026-09-01 18:44 PDT** on GPUs 2+3 (`CUDA_VISIBLE_DEVICES=2,3 --fsdp-devices 2
+--batch-size 4`, batch 2 per device, pid 2926227), exp `v4_stage2a_20260901_r3`, log
+`v4/diagnostics/stage2a_20260901_r3.log`; health signal = `memory_grad_norm` finite and
+`v4_fact_read_loss` falling below ln(3) by step ~200. Battery on GPU 3 after the run.
 
 Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
 `memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception
