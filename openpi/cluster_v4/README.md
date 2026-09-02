@@ -511,9 +511,33 @@ additive; v3.x callers untouched):
   state, no-op without phase metadata, commit == training transition, read-back of the
   committed slot, frozen mode, oracle content, oracle-model refusal).
 
-Not yet done: `scripts/eval_yam_mem_subtask_raw.py` still threads only the visual state;
-a v4 closed-loop replay needs the semantic state threaded through it (and the phase
-controller's E-frame write mask, as v3.5 does).
+**Closed-loop battery `scripts/v4_closed_loop_eval.py` (2026-09-02, commit `ea9ccb9`).**
+Rather than threading the semantic state through the sealed v3.5 raw-video replay
+(`eval_yam_mem_subtask_raw.py`, which authenticates a v3.5 checkpoint protocol v4 does not
+have), the closed-loop test reuses the batteries' development windows and drives them through
+the INFERENCE path: per step `sample_with_memory` (prefill, KV-cache greedy subtask decode,
+action denoising), both banks threaded from the model's OWN transitions (the fact head's
+commits on E steps, not the labels), the sequence clock replicated exactly (step validity,
+`seq_write_mask` E steps, `seq_decay_gap_before` skip-O gap decays via `analytic_decay` on
+both banks before the read). At every decision step (`decision_mask & transition_valid`,
+the same set the sequence batteries score) it records, per condition normal / reset / donor
+(read-side overrides `v4_read_*_state`, carried states untouched, `--bank`):
+
+- the FREE-DECODED subtask and the side it names (left / right / none / both);
+- D = log p(true) - log p(side-swapped) via `forced_subtask_tokens` on the same prefix and
+  memory (the side-flip statistic on the inference path);
+- the read head's slot predictions (read accuracy over committed real slots), and per
+  window: commits, write eligibility, write accuracy at commits, observable-step fact
+  accuracy, action MSE against the recorded chunk (sanity only; static at decision steps).
+
+Headline: free-decode side accuracy per condition and the donor FOLLOWS-CONTENT rate (free
+and D). Agreement with the sequence batteries = the deployment path (cache layout, greedy
+decode, own-head writes) carries the same memory use; disagreement isolates a train/inference
+mismatch. Cost: 1 call per step + 8 extra calls per decision step (batch 4). Runner
+`v4/diagnostics/run_closed_loop_4c_r1.sh` (queued on the H100 job behind the sequence
+batteries; ckpt-999 semantic / visual / both -> `closed_loop_4c_r1_999_<bank>/`,
+status `closed_loop_4c_r1_status.log`). Pure-function tests: `v4_closed_loop_eval_test.py`.
+The raw-video replay script stays v3.x-only.
 
 Historical (2b-era) plan, kept for the record: battery plan for 2b = `v4_stage2_eval.py`
 + `v4_side_flip_eval.py` on ckpt 500/999; the 2a/2b gap = perception error of the
