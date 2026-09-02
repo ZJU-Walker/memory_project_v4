@@ -129,7 +129,20 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--params", type=pathlib.Path, required=True)
     parser.add_argument("--config-name", default="pi05_yam_mem_v4_stage4c")
-    parser.add_argument("--split", choices=("development", "train"), default="development")
+    parser.add_argument(
+        "--split",
+        choices=("development", "train", "final_test"),
+        default="development",
+        help="final_test is the SEALED 8-episode split: touch it once, at the end, and record it.",
+    )
+    parser.add_argument(
+        "--write-policy",
+        choices=("manifest", "always"),
+        default="manifest",
+        help="when the banks may commit: 'manifest' = the episode manifest's evidence (E) frames, as in "
+        "training and the sequence batteries; 'always' = every valid memory tick, so only the fact "
+        "head's confidence gate decides -- the schedule a real robot has to use (no manifest).",
+    )
     parser.add_argument("--batches", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=4)
@@ -280,7 +293,10 @@ def main(argv=None) -> None:
                 tokenized_prompt_mask=observation.tokenized_prompt_mask[:, t],
                 token_state_mask=None if token_state_mask is None else token_state_mask[:, t],
             )
-            write_now = write_mask[:, t] & transition_valid
+            if args.write_policy == "manifest":
+                write_now = write_mask[:, t] & transition_valid
+            else:
+                write_now = transition_valid.copy()
             clock = {
                 "v35_transition_valid": jnp.asarray(transition_valid),
                 "v35_write_mask": jnp.asarray(write_now),
@@ -480,6 +496,7 @@ def main(argv=None) -> None:
         "config_name": args.config_name,
         "split": args.split,
         "intervention_bank": args.bank,
+        "write_policy": args.write_policy,
         "batches": args.batches,
         "batch_size": args.batch_size,
         "max_decode_steps": args.max_decode_steps,
