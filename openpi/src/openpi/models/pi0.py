@@ -4943,6 +4943,10 @@ class Pi0(_model.BaseModel):
                     # is scored with the true and the side-swapped subtask strings.
                     "v4_decision_ce_per_sequence": jnp.sum(ys["v4_decision_ce"], axis=0),
                     "v4_decision_count_per_sequence": jnp.sum(ys["v4_decision_count"], axis=0),
+                    # Per-step [T, b] decision CE (mean over the step's causal tokens) and the
+                    # decision indicator, so the battery can contrast strings step by step.
+                    "v4_decision_ce_steps": ys["v4_decision_ce"],
+                    "v4_decision_active_steps": ys["v4_decision_count"],
                     "v4_use_flow_sum": jnp.sum(ys["v4_use_flow"]),
                     "v4_use_count": jnp.sum(ys["v4_use_count"]),
                     "v4_fact_read_ce_sum": jnp.sum(ys["v4_fact_read_ce"]),

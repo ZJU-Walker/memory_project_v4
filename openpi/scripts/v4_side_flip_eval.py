@@ -4,11 +4,13 @@ At the (static) decision step of every held-out sequence the canonical subtask s
 the side ("wait; target bin is left" / "... right"; the side word is a single PaliGemma token,
 `▁left`=2731 / `▁right`=1833). The same sequence is scored twice under each memory condition:
 with its true string and with the side word swapped, everything else (context, FAST action
-tokens, memory writes) identical. The per-sequence statistic is
+tokens, memory writes) identical. The per-DECISION-STEP statistic is
 
-    D = log p(true string) - log p(side-swapped string)        (nats, decision step only)
+    D = log p(true string) - log p(side-swapped string)        (nats, that step's string)
 
-so D > 0 means the model names the TRUE side. Conditions (read-side interventions on the
+so D > 0 means the model names the TRUE side. A window may hold several waiting frames
+(decision steps); every one is scored, and the report also gives the first-step-only view
+(one term per sequence). Steps whose string names no side are excluded and counted. Conditions (read-side interventions on the
 decision step only, exactly as `v4_stage2_eval.py`):
 
 * normal: the sequence's own semantic bank            -> expect D > 0
@@ -52,31 +54,20 @@ def swap_side_tokens(causal: np.ndarray, causal_mask: np.ndarray, fast_mask: np.
     return swapped
 
 
-def decision_token_stats(observation) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per sequence: number of decision steps, causal-token count at the (first) decision
-    step, and whether that step's text carries a side token."""
-    decision = np.asarray(observation.seq_decision_mask) & np.asarray(observation.seq_step_mask)
-    causal = np.asarray(observation.tokenized_causal)
-    causal_mask = np.asarray(observation.tokenized_causal_mask)
-    fast = np.asarray(observation.causal_fast_mask)
-    n_decision = decision.sum(axis=1)
-    token_count = np.zeros(decision.shape[0], dtype=np.int64)
-    has_side = np.zeros(decision.shape[0], dtype=bool)
-    for b in range(decision.shape[0]):
-        steps = np.flatnonzero(decision[b])
-        if steps.size == 0:
-            continue
-        t = int(steps[0])
-        token_count[b] = int(causal_mask[b, t].sum())
-        text = causal_mask[b, t] & ~fast[b, t]
-        has_side[b] = bool(np.any(text & np.isin(causal[b, t], (LEFT_TOKEN, RIGHT_TOKEN))))
-    return n_decision, token_count, has_side
+def summarize(records: list[dict], *, first_step_only: bool = False) -> dict:
+    """Aggregate per-decision-step D values into the headline statistics.
 
-
-def summarize(records: list[dict]) -> dict:
-    """Aggregate per-sequence D values into the headline statistics."""
+    ``first_step_only`` restricts to each sequence's first decision step (one term per
+    sequence, the battery's original unit); otherwise every decision step counts."""
+    if first_step_only:
+        records = [r for r in records if r["decision_order"] == 0]
     valid = [r for r in records if r["included"]]
-    out = {"sequences": len(records), "included": len(valid), "excluded_no_side_token": len(records) - len(valid)}
+    out = {
+        "decision_steps": len(records),
+        "sequences": len({(r["batch"], r["row"]) for r in records}),
+        "included": len(valid),
+        "excluded_no_side_token": len(records) - len(valid),
+    }
     if not valid:
         return out
     for cond in CONDITIONS:
@@ -160,70 +151,81 @@ def main(argv=None) -> None:
         batch = sides.shape[0]
         # The model's donor intervention is jnp.roll(state, 1, axis=0): sequence b reads b-1.
         donor_sides = np.roll(sides, 1)
-        n_decision, token_count, has_side = decision_token_stats(observation)
-        swapped_causal = swap_side_tokens(
-            np.asarray(observation.tokenized_causal),
-            np.asarray(observation.tokenized_causal_mask),
-            np.asarray(observation.causal_fast_mask),
-        )
+        causal = np.asarray(observation.tokenized_causal)
+        causal_mask = np.asarray(observation.tokenized_causal_mask)
+        fast_mask = np.asarray(observation.causal_fast_mask)
+        text_mask = causal_mask & ~fast_mask
+        token_count = causal_mask.sum(axis=-1)  # [b, T]
+        has_side = np.any(text_mask & np.isin(causal, (LEFT_TOKEN, RIGHT_TOKEN)), axis=-1)  # [b, T]
+        swapped_causal = swap_side_tokens(causal, causal_mask, fast_mask)
         swapped_observation = observation.replace(tokenized_causal=jax.numpy.asarray(swapped_causal))
         step_rng = jax.random.fold_in(rng, index)
         ce = {}
+        active = None
         for cond in CONDITIONS:
             intervention = None if cond == "normal" else cond
             for tag, obs in (("true", observation), ("swap", swapped_observation)):
                 losses = sequence_loss(step_rng, obs, actions, train=False, v4_intervention=intervention)
-                per_seq = np.asarray(jax.device_get(losses["v4_decision_ce_per_sequence"]))
-                count = np.asarray(jax.device_get(losses["v4_decision_count_per_sequence"]))
-                ce[(cond, tag)] = per_seq / np.maximum(count, 1.0)
-                ce[(cond, tag, "count")] = count
+                # [T, b] -> [b, T]; the CE is the mean over the step's causal tokens, masked to
+                # decision steps by the model (transition-valid waiting frames).
+                ce[(cond, tag)] = np.asarray(jax.device_get(losses["v4_decision_ce_steps"])).T
+                if active is None:
+                    active = np.asarray(jax.device_get(losses["v4_decision_active_steps"])).T > 0.5
         for b in range(batch):
-            count = float(ce[("normal", "true", "count")][b])
-            included = bool(has_side[b] and count == 1.0 and token_count[b] > 0)
-            record = {
-                "batch": index,
-                "row": b,
-                "side": int(sides[b]),
-                "donor_side": int(donor_sides[b]),
-                "donor_mismatched": bool(sides[b] != donor_sides[b]),
-                "decision_steps": float(count),
-                "decision_tokens": int(token_count[b]),
-                "has_side_token": bool(has_side[b]),
-                "included": included,
-            }
-            for cond in CONDITIONS:
-                # mean-token CE difference x token count = log p(true) - log p(swapped)
-                record[f"D_{cond}"] = float((ce[(cond, "swap")][b] - ce[(cond, "true")][b]) * token_count[b])
-                record[f"ce_true_{cond}"] = float(ce[(cond, "true")][b])
-                record[f"ce_swap_{cond}"] = float(ce[(cond, "swap")][b])
-            records.append(record)
+            steps = np.flatnonzero(active[b])
+            for order, t in enumerate(steps):
+                included = bool(has_side[b, t] and token_count[b, t] > 0)
+                record = {
+                    "batch": index,
+                    "row": b,
+                    "step": int(t),
+                    "decision_order": order,  # 0 = first decision step of the sequence
+                    "side": int(sides[b]),
+                    "donor_side": int(donor_sides[b]),
+                    "donor_mismatched": bool(sides[b] != donor_sides[b]),
+                    "decision_tokens": int(token_count[b, t]),
+                    "has_side_token": bool(has_side[b, t]),
+                    "included": included,
+                }
+                for cond in CONDITIONS:
+                    # mean-token CE difference x token count = log p(true) - log p(swapped)
+                    record[f"D_{cond}"] = float((ce[(cond, "swap")][b, t] - ce[(cond, "true")][b, t]) * token_count[b, t])
+                    record[f"ce_true_{cond}"] = float(ce[(cond, "true")][b, t])
+                    record[f"ce_swap_{cond}"] = float(ce[(cond, "swap")][b, t])
+                records.append(record)
         print(f"batch {index + 1}/{args.batches} done", flush=True)
 
     summary = summarize(records)
-    # Print the headline BEFORE writing the report so the numbers survive any write failure.
-    print(
-        f"sequences={summary['sequences']} included={summary['included']} "
-        f"excluded_no_side_token={summary['excluded_no_side_token']}"
-    )
-    for cond in CONDITIONS:
-        if f"{cond}_side_accuracy" in summary:
+    summary_first = summarize(records, first_step_only=True)
+
+    def show(title: str, s: dict) -> None:
+        # Print the headline BEFORE writing the report so the numbers survive any write failure.
+        print(
+            f"[{title}] decision_steps={s['decision_steps']} sequences={s['sequences']} "
+            f"included={s['included']} excluded_no_side_token={s['excluded_no_side_token']}"
+        )
+        for cond in CONDITIONS:
+            if f"{cond}_side_accuracy" in s:
+                print(
+                    f"  {cond:6s} side_accuracy={s[f'{cond}_side_accuracy']:.3f} "
+                    f"mean_margin={s[f'{cond}_mean_margin']:+.3f} nats "
+                    f"mean_abs_margin={s[f'{cond}_mean_abs_margin']:.3f}"
+                )
+        if "donor_flip_rate_mismatched" in s:
             print(
-                f"  {cond:6s} side_accuracy={summary[f'{cond}_side_accuracy']:.3f} "
-                f"mean_margin={summary[f'{cond}_mean_margin']:+.3f} nats "
-                f"mean_abs_margin={summary[f'{cond}_mean_abs_margin']:.3f}"
+                f"  donor mismatched pairs={s['donor_mismatched_pairs']}: "
+                f"FLIP RATE (prefers donor's side)={s['donor_flip_rate_mismatched']:.3f} "
+                f"mean_margin={s['donor_mean_margin_mismatched']:+.3f} "
+                f"margin_shift_vs_normal={s['donor_margin_shift_mismatched']:+.3f}"
             )
-    if "donor_flip_rate_mismatched" in summary:
-        print(
-            f"  donor mismatched pairs={summary['donor_mismatched_pairs']}: "
-            f"FLIP RATE (prefers donor's side)={summary['donor_flip_rate_mismatched']:.3f} "
-            f"mean_margin={summary['donor_mean_margin_mismatched']:+.3f} "
-            f"margin_shift_vs_normal={summary['donor_margin_shift_mismatched']:+.3f}"
-        )
-    if "donor_side_accuracy_matched" in summary:
-        print(
-            f"  donor matched pairs={summary['donor_matched_pairs']}: "
-            f"side_accuracy={summary['donor_side_accuracy_matched']:.3f}"
-        )
+        if "donor_side_accuracy_matched" in s:
+            print(
+                f"  donor matched pairs={s['donor_matched_pairs']}: "
+                f"side_accuracy={s['donor_side_accuracy_matched']:.3f}"
+            )
+
+    show("all decision steps", summary)
+    show("first decision step per sequence", summary_first)
 
     def json_default(value):
         # numpy scalars that slip through (np.bool_, np.integer, np.floating)
@@ -239,6 +241,7 @@ def main(argv=None) -> None:
         "batch_size": args.batch_size,
         "parameter_tree_sha256": parameter_tree_sha256,
         "summary": summary,
+        "summary_first_decision_step": summary_first,
         "records": records,
     }
     body = json.dumps(report, indent=2, sort_keys=True, default=json_default) + "\n"
