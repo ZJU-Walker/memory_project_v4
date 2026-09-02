@@ -190,6 +190,13 @@ class DataConfig:
     # Fraction of the memory-critical branch represented as sparse E -> analytic skip-O -> D
     # sequences.  Revision 4 freezes an equal natural/sparse mixture.
     memory_sparse_skip_o_prob: float = 0.0
+    # v4 Stage 4d (2026-09-02): let BOTH banks commit on every valid step instead of only on
+    # manifest evidence (E) frames. The semantic bank still commits only where its fact head is
+    # confident and non-`unknown`; the visual bank now stores every frame, as v3/v3.1 did and as
+    # a robot without a manifest does at deployment (`serve_yam_memory.py --write-policy always`).
+    # Read-state validity, credit reachability and the D-anchor checks stay defined by the
+    # evidence frames, so the decision-step supervision is unchanged.
+    memory_write_every_step: bool = False
     # Strict stationary-D detection must inspect the complete state vector.  None keeps the
     # legacy detector dimension-agnostic; v3.5 requires 14.
     memory_waiting_state_dim: int | None = None
@@ -263,9 +270,7 @@ class DataConfig:
             if self.memory_v4_fact_labels_sha256 is None:
                 raise ValueError("the v4 fact-label sidecar requires an exact pinned SHA256.")
             if self.memory_episode_manifest_sha256 is None:
-                raise ValueError(
-                    "v4 fact labels require the frozen manifest SHA256 pin (the sidecar cross-checks it)."
-                )
+                raise ValueError("v4 fact labels require the frozen manifest SHA256 pin (the sidecar cross-checks it).")
 
 
 class GroupFactory(Protocol):
@@ -649,6 +654,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
                     evidence_subtasks=tuple(base_config.evidence_subtasks),
                     memory_required_subtasks=tuple(base_config.memory_required_subtasks),
                     state_mask_prob=getattr(model_config, "memory_state_mask_prob", 0.0),
+                    write_every_step=base_config.memory_write_every_step,
                 ),
             )
         if use_memory:
@@ -2032,7 +2038,8 @@ _CONFIGS = [
             memory_sem_injection_c=1.0,
             memory_sem_injection_tau=0.02,
             memory_sem_injection_gate_init=0.5,
-        ), v4_data=LeRobotYamDataConfig(
+        ),
+        v4_data=LeRobotYamDataConfig(
             repo_id=_project_paths.V35_REPO_ID,
             base_config=DataConfig(
                 prompt_from_episode_meta=True,
@@ -2479,6 +2486,91 @@ _CONFIGS = [
                 num_train_steps=1_000,
                 save_interval=250,
                 keep_period=250,
+                num_workers=12,
+                fsdp_devices=1,
+            ),
+            TrainConfig(
+                name="pi05_yam_mem_v4_stage4d",
+                v4_protocol=True,
+                # Stage 4d (2026-09-02, after the first robot trial of Stage 4c): the same model
+                # and losses as Stage 4c, trained the way it is deployed. (a) Both banks may
+                # commit on EVERY valid step (`memory_write_every_step`): the semantic bank
+                # still commits only where the fact head is confident and non-unknown, the
+                # visual bank stores every frame -- on the robot the server allows a write at
+                # every tick, and Stage 4c's evidence-only visual writes made the start pose
+                # (lids closed, arms at rest, visual bank already written) look like the
+                # post-inspection waiting state, so the policy waited or guessed a side.
+                # (b) More windows start at frame 0 (`memory_slice_prob` 0.5 -> 0.4: full-episode
+                # starts 25% -> 30% of the mix) so "blank banks + rest pose -> open both lids"
+                # is supervised directly. (c) 6000 updates instead of 1000: the pick-up motion,
+                # not the memory decision, needs the steps (Stage 4c's action head saw ~2000
+                # windows from the generic pi05 base). Everything else is Stage 4c.
+                model=dataclasses.replace(
+                    v4_model,
+                    memory_fact_oracle_writes=False,
+                    memory_v4_visual_injection=True,
+                    memory_fact_loss_weight=0.0,
+                    memory_fact_read_loss_weight=0.3,
+                    memory_sem_injection_c=12.4,
+                    memory_sem_injection_tau=0.02,
+                    memory_sem_injection_gate_init=0.5,
+                    memory_injection_c=12.4,
+                    memory_injection_tau=0.02,
+                    memory_injection_gate_init=0.5,
+                    memory_write_side_loss_weight=1e-6,
+                    memory_read_side_loss_weight=1e-6,
+                ),
+                data=dataclasses.replace(
+                    v4_data,
+                    base_config=dataclasses.replace(
+                        v4_data.base_config,
+                        memory_write_every_step=True,
+                        memory_slice_prob=0.4,
+                    ),
+                ),
+                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
+                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
+                freeze_filter=nnx_utils.PathRegex(
+                    r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed"
+                    r"|memory/gate|memory_gate|memory_inject_w|memory_sem_inject_w|memory_semantic/gate"
+                    r"|memory_write_side_head|memory_read_side_head"
+                    r"|PaliGemma/img/|PaliGemma/llm/embedder).*"
+                ),
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=200,
+                    peak_lr=5e-5,
+                    decay_steps=10_000,
+                    decay_lr=5e-5,
+                ),
+                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+                memory_grad_clip=5.0,
+                ema_decay=None,
+                probe_lr=1e-2,
+                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+                    "gs://openpi-assets/checkpoints/pi05_base/params",
+                    matched_allowlist=(
+                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+                    ),
+                    fresh_init_allowlist=(
+                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+                    ),
+                ),
+                v4_graft_sources=(
+                    (
+                        r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed).*",
+                        str(
+                            _project_paths.project_path(
+                                _project_paths.V4_CHECKPOINTS_DIR
+                                / "pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params"
+                            )
+                        ),
+                    ),
+                ),
+                num_train_steps=6_000,
+                save_interval=500,
+                keep_period=500,
                 num_workers=12,
                 fsdp_devices=1,
             ),

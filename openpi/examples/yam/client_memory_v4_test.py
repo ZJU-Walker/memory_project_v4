@@ -57,7 +57,7 @@ def test_validate_v4_metadata_accepts_the_stage4c_contract():
     ("override", "match"),
     [
         ({"memory_v4_dual_bank": False}, "v4 dual-bank"),
-        ({"write_policy": "client"}, "write-policy always"),
+        ({"write_policy": "client"}, "write-policy head"),
         ({"memory_stride_frames": 10}, "trained at 15"),
         ({"rtc_max_delay": 4}, "RTC maximum"),
         ({"rtc_enabled": False}, "RTC-trained"),

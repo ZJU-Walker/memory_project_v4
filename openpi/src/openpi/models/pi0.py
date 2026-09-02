@@ -3535,6 +3535,7 @@ class Pi0(_model.BaseModel):
         v4_oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
         v4_read_semantic_state: _memory.MemoryState | None = None,
         v4_read_visual_state: _memory.MemoryState | None = None,
+        v4_write_mask_from_head: bool = False,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens.
 
@@ -3608,12 +3609,22 @@ class Pi0(_model.BaseModel):
             geometry_aux = {}
 
         def finish(actions, tokens, token_mask, *, extra=None):
+            effective_write_mask = v35_write_mask
+            head_gate = None
+            if v4_on:
+                # The memory-blind fact head on THIS frame; its eligibility can gate the
+                # write clock of both banks (deployment without a manifest, see the docstring).
+                fact_logits = self.v4_fact_logits(prepared["h8_top"])
+                if v4_write_mask_from_head:
+                    head_gate = jnp.any(self.v4_fact_write_intent(fact_logits)["write_eligible"], axis=-1)
+                    caller_mask = self._v35_inference_mask(v35_write_mask, batch_size=batch, name="v35_write_mask")
+                    effective_write_mask = caller_mask & head_gate
             if getattr(self, "memory_v35_enabled", False):
                 new_state, write_aux = self._v35_inference_transition(
                     memory_state,
                     write_tokens,
                     transition_valid=v35_transition_valid,
-                    write_mask=v35_write_mask,
+                    write_mask=effective_write_mask,
                     write_mode=write_mode,
                 )
             else:
@@ -3639,10 +3650,11 @@ class Pi0(_model.BaseModel):
                 transition_valid_mask = self._v35_inference_mask(
                     v35_transition_valid, batch_size=batch, name="v35_transition_valid"
                 )
-                write_eligible = self._v35_inference_mask(v35_write_mask, batch_size=batch, name="v35_write_mask")
+                write_eligible = self._v35_inference_mask(
+                    effective_write_mask, batch_size=batch, name="v35_write_mask"
+                )
                 transition_applied = transition_valid_mask & (write_mode != "frozen")
                 sem_write_requested = transition_applied & write_eligible & (write_mode == "normal")
-                fact_logits = self.v4_fact_logits(prepared["h8_top"])
                 if v4_oracle_targets is not None:
                     sem_candidate, sem_aux = self.v4_semantic_write(
                         semantic_state,
@@ -3667,6 +3679,9 @@ class Pi0(_model.BaseModel):
                     "v4_fact_predicted": sem_aux["fact_predicted"],
                     "v4_fact_confidence": sem_aux["fact_confidence"],
                     "v4_fact_write_eligible": sem_aux["fact_write_eligible"],
+                    "v4_head_write_gate": (
+                        head_gate if head_gate is not None else jnp.ones((batch,), dtype=bool)
+                    ),
                     # Read side of this step (pre-transition bank): raw slot retrieval and the
                     # read head's per-slot fact logits, for closed-loop read-accuracy tracking.
                     "v4_sem_retrieved": sem_retrieved,
@@ -3858,6 +3873,7 @@ class Pi0(_model.BaseModel):
         v4_oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
         v4_read_semantic_state: _memory.MemoryState | None = None,
         v4_read_visual_state: _memory.MemoryState | None = None,
+        v4_write_mask_from_head: bool = False,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
 
@@ -3865,6 +3881,14 @@ class Pi0(_model.BaseModel):
         the bank the model READS this step while the carried ``semantic_state`` /
         ``memory_state`` still receive the transition -- the closed-loop counterpart of the
         sequence path's read-side-only reset/donor interventions.
+
+        ``v4_write_mask_from_head`` (v4 deployment): AND the caller's ``v35_write_mask`` with
+        the fact head's own eligibility on this frame (any slot confident and non-``unknown``),
+        for BOTH banks. Training committed only on manifest evidence frames, i.e. frames where
+        the facts are visible; a robot has no manifest, and the head was trained to be
+        confident exactly there, so this reproduces the training write schedule without one.
+        Without it the visual bank would commit every tick (the semantic bank is gated per
+        slot either way).
 
         v4 dual-bank models additionally REQUIRE ``semantic_state`` (the semantic bank; start
         from ``memory_semantic.init_state(batch)``). The returned ``memory_state`` is the
@@ -3925,6 +3949,8 @@ class Pi0(_model.BaseModel):
             raise ValueError("v4_oracle_targets and v4_oracle_slot_mask must be provided together.")
         if not v4_on and (v4_read_semantic_state is not None or v4_read_visual_state is not None):
             raise ValueError("v4_read_*_state overrides are v4 dual-bank diagnostics only.")
+        if not v4_on and v4_write_mask_from_head:
+            raise ValueError("v4_write_mask_from_head requires a memory_v4_dual_bank model (it needs the fact head).")
         if v4_on and getattr(self, "memory_fact_oracle_writes", False) and v4_oracle_targets is None:
             raise ValueError(
                 "this model was trained with oracle semantic writes (Stage 2a); pass v4_oracle_targets and "
@@ -3963,6 +3989,7 @@ class Pi0(_model.BaseModel):
                 v4_oracle_slot_mask=v4_oracle_slot_mask,
                 v4_read_semantic_state=v4_read_semantic_state,
                 v4_read_visual_state=v4_read_visual_state,
+                v4_write_mask_from_head=v4_write_mask_from_head,
             )
         if any(
             value is not None

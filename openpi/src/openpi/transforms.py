@@ -842,6 +842,9 @@ class MemoryV34Labels(DataTransformFn):
     evidence_subtasks: tuple[str, ...]
     memory_required_subtasks: tuple[str, ...]
     state_mask_prob: float = 0.0
+    # v4 Stage 4d: `seq_write_mask` = every valid step (both banks may commit every tick);
+    # state validity / credit / D-anchor checks still follow the evidence frames.
+    write_every_step: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         subtask = data.get("subtask")
@@ -902,7 +905,11 @@ class MemoryV34Labels(DataTransformFn):
             if tail_valid.shape != step_mask.shape or action_overlap.shape != step_mask.shape:
                 raise ValueError("v3.5 raw-frame selectors must have the same shape as seq_step_mask.")
 
-            write_mask = evidence_mask & tail_valid & step_mask
+            evidence_write = evidence_mask & tail_valid & step_mask
+            # Clock mask handed to the model. Under write_every_step every valid step may
+            # commit (the semantic bank still gates per slot on the head's confidence); the
+            # evidence-only mask below keeps defining state validity and the D anchors.
+            write_mask = step_mask.copy() if self.write_every_step else evidence_write
             decision_mask = waiting_mask & step_mask
             block_boundary = np.asarray(data.get("seq_block_boundary", np.zeros(len(subtask), dtype=bool)), dtype=bool)
             decay_gap = np.asarray(
@@ -912,7 +919,7 @@ class MemoryV34Labels(DataTransformFn):
                 raise ValueError("v3.5 boundary/gap fields must have the same shape as seq_step_mask.")
             if np.any(decay_gap < 0):
                 raise ValueError("seq_decay_gap_before cannot be negative.")
-            if np.any((decay_gap > 0) & (~step_mask | write_mask)):
+            if np.any((decay_gap > 0) & (~step_mask | evidence_write)):
                 raise ValueError("analytic gaps may precede only valid non-E/read steps.")
 
             # Read happens before the current transition.  A fence cuts gradient reach at this
@@ -930,7 +937,7 @@ class MemoryV34Labels(DataTransformFn):
                     have_reachable_write = False
                 state_valid[t] = have_state
                 credit_reachable[t] = have_reachable_write
-                if write_mask[t]:
+                if evidence_write[t]:
                     have_state = True
                     have_reachable_write = True
 

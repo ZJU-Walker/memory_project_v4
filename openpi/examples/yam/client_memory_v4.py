@@ -266,10 +266,10 @@ def validate_v4_metadata(metadata: dict, args: Args) -> None:
         )
     if metadata.get("memory_architecture") != "v32_layer8_dual_query":
         raise ValueError(f"unexpected memory_architecture {metadata.get('memory_architecture')!r}")
-    if metadata.get("write_policy") != "always":
+    if metadata.get("write_policy") not in ("head", "always"):
         raise ValueError(
             f"server write_policy is {metadata.get('write_policy')!r}; this client sends no per-request write "
-            "flags, so start the server with --write-policy always"
+            "flags, so start the server with --write-policy head (recommended) or always"
         )
     horizon = metadata.get("action_horizon")
     if horizon != args.action_horizon:

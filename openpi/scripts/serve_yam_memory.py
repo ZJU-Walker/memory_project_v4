@@ -70,14 +70,16 @@ class Args:
     config: str = "pi05_yam_mem_v3"
     port: int = 8000
     max_decode_steps: int = 10
-    # v3.5 / v4 only: when a request may COMMIT to the banks ("always" | "client"), see module doc.
-    write_policy: str = "always"
+    # v3.5 / v4 only: when a request may COMMIT to the banks ("head" | "always" | "client"), see
+    # module doc. "head" (v4 default) = both banks commit only on frames where the fact head is
+    # confident a fact is visible -- the training write schedule without a manifest.
+    write_policy: str = "head"
     # Run one synthetic request before serving so the JIT compile (minutes) happens here, not on
     # the robot's first request; the memory is reset afterwards.
     warmup: bool = True
 
 
-WRITE_POLICIES = ("always", "client")
+WRITE_POLICIES = ("head", "always", "client")
 
 
 def _build_server_metadata(
@@ -143,7 +145,8 @@ def _load_fact_names(data_config: Any) -> dict[str, Any] | None:
 def _resolve_write_mask(inputs: dict, write_policy: str) -> bool:
     """Whether this request may commit (v3.5/v4). Pops the client's "memory_write" flag."""
     requested = inputs.pop("memory_write", None)
-    if write_policy == "always":
+    if write_policy in ("always", "head"):
+        # "head": the mask is asserted here and ANDed with the fact head inside the model.
         return True
     if write_policy == "client":
         return bool(requested) if requested is not None else False
@@ -180,11 +183,16 @@ class MemoryPolicy(_policy.Policy):
         self._simulated_delay = simulated_delay
         if write_policy not in WRITE_POLICIES:
             raise ValueError(f"unsupported write_policy {write_policy!r}; expected one of {WRITE_POLICIES}")
-        self._write_policy = write_policy
         self._v35 = bool(getattr(model, "memory_v35_enabled", False))
         self._v4 = bool(getattr(model, "memory_v4_dual_bank", False))
+        if write_policy == "head" and not self._v4:
+            raise ValueError(
+                "write_policy='head' needs a v4 dual-bank checkpoint (the fact head); use 'always' or 'client'."
+            )
+        self._write_policy = write_policy
         self._sample = nnx_utils.module_jit(
-            model.sample_with_memory, static_argnames=("stop_token", "max_decode_steps", "num_steps", "write_mode")
+            model.sample_with_memory,
+            static_argnames=("stop_token", "max_decode_steps", "num_steps", "write_mode", "v4_write_mask_from_head"),
         )
         self._init_state = lambda: model.memory.init_state(1)
         self._init_semantic_state = (lambda: model.memory_semantic.init_state(1)) if self._v4 else None
@@ -288,6 +296,8 @@ class MemoryPolicy(_policy.Policy):
             # One request = one valid memory-clock transition (call at memory_stride_frames).
             clock["v35_transition_valid"] = jnp.ones((1,), dtype=bool)
             clock["v35_write_mask"] = jnp.asarray([write_allowed], dtype=bool)
+            if self._write_policy == "head":
+                clock["v4_write_mask_from_head"] = True
         start_time = time.monotonic()
         with self._lock:
             self._rng, sample_rng = jax.random.split(self._rng)
@@ -343,6 +353,7 @@ class MemoryPolicy(_policy.Policy):
             # Slots that have committed at least once since the reset: the read head's decode
             # of a never-written slot is a bias artefact and the client blanks it.
             outputs["sem_written"] = sem_written.tolist()
+            outputs["head_write_gate"] = bool(np.asarray(aux["v4_head_write_gate"])[0])
             read_logits = np.asarray(aux["v4_fact_read_logits"])[0]
             outputs["read_predicted"] = np.argmax(read_logits, axis=-1).astype(int).tolist()
             outputs["sem_injected_rms"] = float(np.asarray(aux["v4_sem_injected_pre_cast_rms"])[0])

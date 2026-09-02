@@ -55,9 +55,7 @@ def _v35_kwargs(**overrides) -> dict:
 def test_v4_config_requires_delta_semantic_bank_and_v35_semantics():
     # Valid v4 config: dual bank on top of a legal v3.5 config.
     config = pi0_config.Pi0Config(
-        **_v35_kwargs(
-            memory_v4_dual_bank=True, memory_mask_zero_tokens=True, memory_semantic=_delta_memory_config()
-        )
+        **_v35_kwargs(memory_v4_dual_bank=True, memory_mask_zero_tokens=True, memory_semantic=_delta_memory_config())
     )
     observation_spec, _ = config.inputs_spec(batch_size=2)
     assert observation_spec.seq_fact_labels.shape == (2, config.memory_fact_slots)
@@ -74,9 +72,7 @@ def test_v4_config_requires_delta_semantic_bank_and_v35_semantics():
         pi0_config.Pi0Config(**_v35_kwargs(memory_v4_dual_bank=True, memory_semantic=_delta_memory_config()))
     with pytest.raises(ValueError, match="pooled-frame delta_output"):
         pi0_config.Pi0Config(
-            **_v35_kwargs(
-                memory_v4_dual_bank=True, memory_mask_zero_tokens=True, memory_semantic=memory.MemoryConfig()
-            )
+            **_v35_kwargs(memory_v4_dual_bank=True, memory_mask_zero_tokens=True, memory_semantic=memory.MemoryConfig())
         )
     with pytest.raises(ValueError, match="alpha_step"):
         pi0_config.Pi0Config(
@@ -151,9 +147,7 @@ class _TinyV4(nnx.Module):
         self.fact_logit_head = nnx.Linear(width, 3, rngs=rngs)
         self.fact_value_embed = nnx.Param(jax.random.normal(rngs.params(), (3, width), dtype=jnp.float32))
         self.memory_fact_read_head = nnx.Linear(width, 3, rngs=rngs)
-        self.memory_sem_inject_w = nnx.Param(
-            jnp.full((width,), jnp.arctanh(jnp.float32(0.5)), dtype=jnp.float32)
-        )
+        self.memory_sem_inject_w = nnx.Param(jnp.full((width,), jnp.arctanh(jnp.float32(0.5)), dtype=jnp.float32))
         self.memory_sem_slot_embedding = nnx.Param(jnp.zeros((4, width), dtype=jnp.float32))
 
 
@@ -177,9 +171,7 @@ def test_write_intent_gates_on_confidence_and_never_writes_unknown(tiny_v4):
     # slot 2: uniform (confidence 1/3 < 0.6); slot 3: mildly target1 (still < 0.6)
     logits = logits.at[0, 3, 1].set(0.5)
     intent = tiny_v4.v4_fact_write_intent(logits)
-    np.testing.assert_array_equal(
-        np.asarray(intent["write_eligible"][0]), np.asarray([True, False, False, False])
-    )
+    np.testing.assert_array_equal(np.asarray(intent["write_eligible"][0]), np.asarray([True, False, False, False]))
     np.testing.assert_array_equal(np.asarray(intent["predicted"][0, :2]), np.asarray([0, 2], dtype=np.int32))
     np.testing.assert_allclose(np.asarray(jnp.linalg.norm(intent["values"], axis=-1)), 1.0, atol=1e-5)
     np.testing.assert_allclose(np.asarray(jnp.linalg.norm(intent["keys"], axis=-1)), 1.0, atol=1e-5)
@@ -260,9 +252,7 @@ class _TinyV4Seq(_TinyV35):
         self.fact_logit_head.bias.value = jnp.asarray([8.0, 0.0, -8.0], dtype=jnp.float32)
         self.fact_value_embed = nnx.Param(jax.random.normal(rngs.params(), (3, width), dtype=jnp.float32))
         self.memory_fact_read_head = nnx.Linear(width, 3, rngs=rngs)
-        self.memory_sem_inject_w = nnx.Param(
-            jnp.full((width,), jnp.arctanh(jnp.float32(0.5)), dtype=jnp.float32)
-        )
+        self.memory_sem_inject_w = nnx.Param(jnp.full((width,), jnp.arctanh(jnp.float32(0.5)), dtype=jnp.float32))
         self.memory_sem_slot_embedding = nnx.Param(jnp.zeros((3, width), dtype=jnp.float32))
 
 
@@ -410,7 +400,9 @@ def test_v4_visual_and_both_interventions_are_read_side_only(tiny_v4_seq):
             assert np.isfinite(np.asarray(value)).all(), key
     # Batch of one: a visual donor roll is the sample itself -> bitwise the normal run.
     visual_donor = run("visual_donor")
-    np.testing.assert_array_equal(np.asarray(visual_donor["v4_decision_ce_sum"]), np.asarray(normal["v4_decision_ce_sum"]))
+    np.testing.assert_array_equal(
+        np.asarray(visual_donor["v4_decision_ce_sum"]), np.asarray(normal["v4_decision_ce_sum"])
+    )
     with pytest.raises(ValueError, match="unsupported v4_intervention"):
         run("audio_reset")
 
@@ -425,9 +417,7 @@ def test_v4_sequence_requires_fact_fields_and_interface_requires_semantic_state(
     mask = jnp.ones((1, 4), dtype=bool)
     ar = jnp.zeros((1, 4), dtype=jnp.int32)
     with pytest.raises(ValueError, match="semantic bank state"):
-        tiny_v4_seq._v32_prepare_memory_interface(
-            prefix, mask, ar, tiny_v4_seq.memory.init_state(1), top_token_count=2
-        )
+        tiny_v4_seq._v32_prepare_memory_interface(prefix, mask, ar, tiny_v4_seq.memory.init_state(1), top_token_count=2)
 
 
 def test_semantic_injection_is_exactly_zero_for_a_fresh_bank_with_finite_backward(tiny_v4):
@@ -610,6 +600,53 @@ def test_v4_sample_with_memory_threads_the_semantic_bank(tiny_v4_seq):
             tiny_v4_seq.sample_with_memory(jax.random.key(1), observation, visual, semantic_state=semantic, **kwargs)
     finally:
         tiny_v4_seq.memory_fact_oracle_writes = False
+
+    # Head-gated write clock (deployment without a manifest): with the tiny head confident on
+    # every slot the gate is open and BOTH banks commit; with the head abstaining (bias moved
+    # to `unknown`) the gate closes and both banks only decay, even though the caller asserted
+    # the write mask.
+    _, visual_head, head_aux = tiny_v4_seq.sample_with_memory(
+        jax.random.key(1),
+        observation,
+        visual,
+        semantic_state=semantic,
+        v35_transition_valid=True,
+        v35_write_mask=True,
+        v4_write_mask_from_head=True,
+        **kwargs,
+    )
+    np.testing.assert_array_equal(np.asarray(head_aux["v4_head_write_gate"]), [True])
+    np.testing.assert_array_equal(np.asarray(head_aux["v4_sem_commit_applied"]), [[True, True, True]])
+    np.testing.assert_array_equal(np.asarray(head_aux["write_occurred"]), [True])
+    jax.tree.map(np.testing.assert_array_equal, head_aux["v4_semantic_state"], expected)
+    original_bias = tiny_v4_seq.fact_logit_head.bias.value
+    tiny_v4_seq.fact_logit_head.bias.value = jnp.asarray([-8.0, 0.0, 8.0], dtype=jnp.float32)
+    try:
+        _, visual_closed, closed_aux = tiny_v4_seq.sample_with_memory(
+            jax.random.key(1),
+            observation,
+            visual,
+            semantic_state=semantic,
+            v35_transition_valid=True,
+            v35_write_mask=True,
+            v4_write_mask_from_head=True,
+            **kwargs,
+        )
+    finally:
+        tiny_v4_seq.fact_logit_head.bias.value = original_bias
+    np.testing.assert_array_equal(np.asarray(closed_aux["v4_head_write_gate"]), [False])
+    np.testing.assert_array_equal(np.asarray(closed_aux["v4_sem_commit_applied"]), [[False, False, False]])
+    np.testing.assert_array_equal(np.asarray(closed_aux["write_occurred"]), [False])
+    np.testing.assert_array_equal(np.asarray(closed_aux["v35_decay_only"]), [True])
+    del visual_head, visual_closed
+    tiny_v4_seq.memory_v4_dual_bank = False
+    try:
+        with pytest.raises(ValueError, match="v4_write_mask_from_head"):
+            tiny_v4_seq.sample_with_memory(
+                jax.random.key(1), observation, visual, v4_write_mask_from_head=True, **kwargs
+            )
+    finally:
+        tiny_v4_seq.memory_v4_dual_bank = True
 
     # Read-side override (closed-loop reset/donor): the model READS the override bank (a
     # fresh one retrieves exactly zero) while the carried bank still takes the transition.

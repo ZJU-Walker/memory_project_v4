@@ -249,6 +249,7 @@ def test_resolve_write_mask_follows_policy_and_pops_client_flag() -> None:
     assert serve_yam_memory._resolve_write_mask(inputs, "always") is True
     assert "memory_write" not in inputs  # consumed, never reaches the transforms
 
+    assert serve_yam_memory._resolve_write_mask({"memory_write": False}, "head") is True  # gated in the model
     assert serve_yam_memory._resolve_write_mask({"memory_write": True}, "client") is True
     assert serve_yam_memory._resolve_write_mask({"memory_write": False}, "client") is False
     assert serve_yam_memory._resolve_write_mask({}, "client") is False  # fail closed
