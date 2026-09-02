@@ -383,6 +383,38 @@ def test_v4_reset_intervention_blanks_only_the_decision_step_read(tiny_v4_seq):
         )
 
 
+def test_v4_visual_and_both_interventions_are_read_side_only(tiny_v4_seq):
+    """Stage-4 battery controls: the visual bank can be reset/swapped on decision steps
+    without touching the carried state or any write; 'both' composes the two banks."""
+    observation = _v4_sequence_observation()
+    actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)
+    run = lambda name: tiny_v4_seq._compute_sequence_loss_v32(  # noqa: E731
+        jax.random.key(49), observation, actions, train=False, v4_intervention=name
+    )
+    normal = run(None)
+    visual_reset = run("visual_reset")
+    both_reset = run("both_reset")
+    # Writes are identical under every intervention (carried states untouched).
+    for key in ("v35_commit_success_count", "v4_sem_commit_count"):
+        np.testing.assert_array_equal(visual_reset[key], normal[key])
+        np.testing.assert_array_equal(both_reset[key], normal[key])
+    # A visual reset blanks only the VISUAL read on the decision step: the visual raw read
+    # RMS drops, the semantic raw read is untouched; 'both' blanks the semantic read too.
+    assert float(visual_reset["v35_raw_read_rms_sum"]) < float(normal["v35_raw_read_rms_sum"])
+    np.testing.assert_allclose(
+        np.asarray(visual_reset["v4_sem_raw_read_rms_sum"]), np.asarray(normal["v4_sem_raw_read_rms_sum"])
+    )
+    assert float(both_reset["v4_sem_raw_read_rms_sum"]) < float(normal["v4_sem_raw_read_rms_sum"])
+    for losses in (visual_reset, both_reset):
+        for key, value in losses.items():
+            assert np.isfinite(np.asarray(value)).all(), key
+    # Batch of one: a visual donor roll is the sample itself -> bitwise the normal run.
+    visual_donor = run("visual_donor")
+    np.testing.assert_array_equal(np.asarray(visual_donor["v4_decision_ce_sum"]), np.asarray(normal["v4_decision_ce_sum"]))
+    with pytest.raises(ValueError, match="unsupported v4_intervention"):
+        run("audio_reset")
+
+
 def test_v4_sequence_requires_fact_fields_and_interface_requires_semantic_state(tiny_v4_seq):
     observation = _v35_sequence_observation()
     actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)

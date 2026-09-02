@@ -125,8 +125,17 @@ def main(argv=None) -> None:
     parser.add_argument("--batches", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=4)
+    parser.add_argument(
+        "--bank",
+        choices=("semantic", "visual", "both"),
+        default="semantic",
+        help="which bank the reset/donor interventions act on. With 'visual' the donor pairing "
+        "still uses the semantic expectation (the visual bank carries no labelled fact), so "
+        "read its numbers as: does the decision SURVIVE losing / swapping the visual bank?",
+    )
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
+    intervention_prefix = "" if args.bank == "semantic" else f"{args.bank}_"
 
     output_dir = args.output_dir
     report_path = output_dir / "side_flip_eval.json"
@@ -195,7 +204,7 @@ def main(argv=None) -> None:
         ce = {}
         active = None
         for cond in CONDITIONS:
-            intervention = None if cond == "normal" else cond
+            intervention = None if cond == "normal" else intervention_prefix + cond
             for tag, obs in (("true", observation), ("swap", swapped_observation)):
                 losses = sequence_loss(step_rng, obs, actions, train=False, v4_intervention=intervention)
                 # [T, b] -> [b, T]; the CE is the mean over the step's causal tokens, masked to
@@ -289,6 +298,7 @@ def main(argv=None) -> None:
         "schema_version": SCHEMA_VERSION,
         "config_name": args.config_name,
         "split": args.split,
+        "intervention_bank": args.bank,
         "batches": args.batches,
         "batch_size": args.batch_size,
         "parameter_tree_sha256": parameter_tree_sha256,

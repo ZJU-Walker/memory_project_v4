@@ -4186,11 +4186,24 @@ class Pi0(_model.BaseModel):
         # "donor": the batch neighbour's bank (jnp.roll over the batch axis; the battery
         # pairs opposite-side episodes). The carried state and every write are untouched, so
         # only the read-side counterfactual differs. Diagnostics only; never used in training.
+        # Bank selection (Stage 4 batteries): "reset"/"donor" act on the SEMANTIC bank (the
+        # Stage-2 form), "visual_reset"/"visual_donor" on the visual bank, "both_reset"/
+        # "both_donor" on both -- always read-side only, on decision steps only.
+        _V4_INTERVENTIONS = {
+            "reset": ("semantic", "reset"),
+            "donor": ("semantic", "donor"),
+            "visual_reset": ("visual", "reset"),
+            "visual_donor": ("visual", "donor"),
+            "both_reset": ("both", "reset"),
+            "both_donor": ("both", "donor"),
+        }
+        intervention_bank = intervention_kind = None
         if v4_intervention is not None:
-            if v4_intervention not in ("reset", "donor"):
+            if v4_intervention not in _V4_INTERVENTIONS:
                 raise ValueError(f"unsupported v4_intervention {v4_intervention!r}.")
             if train:
                 raise ValueError("v4_intervention is an evaluation-only control.")
+            intervention_bank, intervention_kind = _V4_INTERVENTIONS[v4_intervention]
 
         b, t = observation.seq_step_mask.shape
         ah, ad = actions.shape[-2:]
@@ -4430,22 +4443,32 @@ class Pi0(_model.BaseModel):
             else:
                 masked_prefix_tokens = prefix_tokens
             read_sem_state = sem_state if v4_on else None
+            read_state = state
             if v4_on and v4_intervention is not None:
-                if v4_intervention == "reset":
-                    alternative = self.memory_semantic.init_state(b)
-                else:
-                    alternative = jax.tree.map(lambda leaf: jnp.roll(leaf, 1, axis=0), sem_state)
                 intervene = x["decision_mask"] & x["step_valid"]
-                read_sem_state = jax.tree.map(
-                    lambda alt, own: jnp.where(intervene.reshape((b,) + (1,) * (own.ndim - 1)), alt, own),
-                    alternative,
-                    sem_state,
-                )
+
+                def counterfactual(own_state, blank_state):
+                    if intervention_kind == "reset":
+                        alternative = blank_state
+                    else:
+                        alternative = jax.tree.map(lambda leaf: jnp.roll(leaf, 1, axis=0), own_state)
+                    return jax.tree.map(
+                        lambda alt, own: jnp.where(intervene.reshape((b,) + (1,) * (own.ndim - 1)), alt, own),
+                        alternative,
+                        own_state,
+                    )
+
+                if intervention_bank in ("semantic", "both"):
+                    read_sem_state = counterfactual(sem_state, self.memory_semantic.init_state(b))
+                if intervention_bank in ("visual", "both"):
+                    # Read-side only, like the semantic form: the carried visual state and
+                    # its writes below are untouched.
+                    read_state = counterfactual(state, self.memory.init_state(b))
             prepared = self._v32_prepare_memory_prefix(
                 masked_prefix_tokens,
                 prefix_mask,
                 prefix_ar,
-                state,
+                read_state,
                 top_token_count=top_tokens,
                 state_token_mask=state_token_mask,
                 semantic_state=read_sem_state,

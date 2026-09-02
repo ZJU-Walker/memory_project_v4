@@ -128,8 +128,16 @@ def main(argv=None) -> None:
     parser.add_argument("--batches", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=4)
+    parser.add_argument(
+        "--bank",
+        choices=("semantic", "visual", "both"),
+        default="semantic",
+        help="which bank the reset/donor interventions act on (Stage 4: 'visual' shows whether "
+        "the decision survives losing the visual bank; 'both' removes all memory).",
+    )
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
+    intervention_prefix = "" if args.bank == "semantic" else f"{args.bank}_"
 
     output_dir = args.output_dir
     report_path = output_dir / "stage2_eval.json"
@@ -184,7 +192,11 @@ def main(argv=None) -> None:
         step_rng = jax.random.fold_in(rng, index)
         for cond in CONDITIONS:
             losses = sequence_loss(
-                step_rng, observation, actions, train=False, v4_intervention=None if cond == "normal" else cond
+                step_rng,
+                observation,
+                actions,
+                train=False,
+                v4_intervention=None if cond == "normal" else intervention_prefix + cond,
             )
             for k in keys:
                 sums[cond][k] += float(jax.device_get(losses[k]))
@@ -210,6 +222,7 @@ def main(argv=None) -> None:
         "schema_version": SCHEMA_VERSION,
         "config_name": args.config_name,
         "split": args.split,
+        "intervention_bank": args.bank,
         "batches": args.batches,
         "batch_size": args.batch_size,
         "sequences": int(all_sides.shape[0]),
