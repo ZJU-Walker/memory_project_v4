@@ -4938,6 +4938,11 @@ class Pi0(_model.BaseModel):
                     "v4_fact_correct_class": jnp.sum(weighted * ys["v4_fact_correct"][..., None], axis=(0, 1, 2)),
                     "v4_decision_ce_sum": jnp.sum(ys["v4_decision_ce"]),
                     "v4_decision_count": jnp.sum(ys["v4_decision_count"]),
+                    # Per-sequence decision-step sums for the side-contrast battery (one
+                    # decision step per sequence in the frozen manifests): the same sequence
+                    # is scored with the true and the side-swapped subtask strings.
+                    "v4_decision_ce_per_sequence": jnp.sum(ys["v4_decision_ce"], axis=0),
+                    "v4_decision_count_per_sequence": jnp.sum(ys["v4_decision_count"], axis=0),
                     "v4_use_flow_sum": jnp.sum(ys["v4_use_flow"]),
                     "v4_use_count": jnp.sum(ys["v4_use_count"]),
                     "v4_fact_read_ce_sum": jnp.sum(ys["v4_fact_read_ce"]),
