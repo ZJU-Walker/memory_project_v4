@@ -333,7 +333,15 @@ now defaults to this recipe and passes --overwrite when the directory exists wit
 checkpoint, --resume when it holds one). Documented deviation from r3: half the samples per
 update (global batch 2 vs 4) at the same 1000 updates and schedule, so 2b sees half of r3's
 data; ~9.5 s/update, ~2.7 h. If the 2a/2b comparison needs matched data volume, r3 ckpt-500
-(the same 2000 samples) is the fairer 2a reference point than ckpt-999. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+(the same 2000 samples) is the fairer 2a reference point than ckpt-999.
+**2b r1 finished 2026-09-02 04:20** (1000 updates, no preemption, checkpoints 250/500/750/999).
+Trajectory: CE 15.76 -> 6.38 (100) -> 4.29 (200) -> 3.00 (600) -> 2.39 (900); flow 0.162 ->
+0.0108; read loss 1.075 -> 0.994 (200) -> 0.557 (600) -> 0.341 (900); memory-group grad norm
+finite throughout (3.2 -> 0.44). Predicted writes commit at the oracle's rate: commit count ==
+write-eligible count at every interval (~7 commits per sequence, 0 degenerate), i.e. the
+frozen Stage-1 head is confident on the evidence frames. Batteries launched 04:23 on the same
+job (`v4/diagnostics/run_batteries_2b_r1.sh`): `stage2_eval_2b_r1_{999,500}/` and
+`side_flip_2b_r1_{999,500}/` (both with `--config-name pi05_yam_mem_v4_stage2b`). Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
