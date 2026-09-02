@@ -696,6 +696,33 @@ deployment path ahead of the remaining confirmations. Changes:
   null), `client_memory_v4_test.py` (metadata guard, readout). CPU smoke of the real path:
   `v4/diagnostics/server_smoke_cpu.py` (create_policy + warmup + 3 requests on ckpt-999).
 
+**Live-server verification (15:15–15:30, server on iris-hgx-1:8001 next to the running eval,
+`v4/diagnostics/server_v4_smoke_gpu2.log`).** Warmup 37 s (plain) + 18 s (RTC-prefixed) on
+the H100. `client_memory_v4.py --dry-run` from iris-ws-18: contract OK (metadata guard, RTC
+replan, both banks threaded, v4 fields; on noise images the head abstains at 1.00 and nothing
+commits). `v4/diagnostics/server_replay_episode.py` then replayed raw development episodes
+through the websocket exactly as the robot client will (reset, one plain request per 15
+frames, episode prompt, `--write-policy always`):
+
+| episode (dev split) | prompt / true side | commits (correct) | wait ticks: side correct | request |
+|---|---|---|---|---|
+| 0830_bin_part1/demo2 | grey pepper box / left | 12 (12) | 5/5 | 166 ms |
+| 0830_bin_part1/demo2, banks reset before every request | same | 12 (12) | **0/5** | 159 ms |
+| 0830_bin_part1/demo3 | banana / left | 11 (11) | 4/4 | 172 ms |
+| 0830_bin_part1/demo8 | banana / right | 14 (14) | 5/5 | 176 ms |
+
+Timeline of demo2: "open both lids" -> head abstains (unknown, 1.00), bank blank; first
+"inspect both bins" tick -> both slots commit the true facts (banana=right_bin,
+grey_pepper_box=left_bin, 1.00) and keep re-committing the same facts while the bins are
+open; "close both lids" -> head abstains again, bank keeps both facts; every "wait; target
+bin is left" tick decodes "wait; target bin is left". Without memory the same frames decode
+the wrong side at every wait tick. Predicted-chunk RMSE vs the recorded teleop targets
+0.02–0.08 rad per phase (0.02 in the static wait phase). Requests take ~170 ms while the
+eval job shares the GPU, well inside the 500 ms tick. Observed quirk: during the first
+"open both lids" ticks the decoded subtask is sometimes "wait; target bin is right" with an
+empty bank; the actions in that phase still track the recorded opening motion (RMSE 0.06),
+so it is a text-label lag, but watch the arm at episode start on the robot.
+
 Robot-trial runbook (v4):
 
 1. GPU box (inside the SLURM job that owns the H100; the evaluation queue must be killed
