@@ -781,7 +781,12 @@ stats, the Stage-1 head checkpoint and the Stage-4c ckpt-999 policy, project-rel
 paths, SHA256s in its model card). `openpi/cluster_v4/coauthor/` holds the reproduction
 kit: `setup_env.sh` (uv, pinned lock), `download_data.sh` (both HF repos into the project
 layout + digest checks), `train_8gpu.sh` (one-process FSDP on 8 GPUs, batch 16, no SLURM,
-auto-resume), `run_all.sh` (all three), `README.md`, and `upload_artifacts_to_hf.py`.
+auto-resume, wandb on by default into team `kewalk-stanford-university`),
+`upload_checkpoint_to_hf.py` (final step + run manifests + training log to the Hub, falls
+back to the uploader's own namespace when the token cannot write to ours), `run_all.sh` (all
+four, Hub token checked before training), `download_checkpoint.sh` (fetch one step + sidecars
+into any clone and print the serve command; round-trip of the Stage-4c ckpt-999 verified
+byte-identical, 10 GB in 4 min), `README.md`, and `upload_artifacts_to_hf.py`.
 The cluster-specific `cluster_v4/env.sh` (pins HOME) is not used by the kit; it sources
 the path-relative `cluster_v35/env.sh`.
 
