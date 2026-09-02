@@ -648,6 +648,12 @@ decision is untouched by wiping or swapping the visual bank (free-decoded side 1
 normal / visual-reset / visual-donor, D margins +11.5 / +8.3 / +11.5) -- the visual bank is
 inert for the decision on the deployment path too, as on the sequence path.
 
+**Closed-loop, both banks, ckpt-999 (15:38):** normal 1.000; with BOTH banks blank at the
+decision step the model stops naming a side at all (no side word in 44/48 first decision
+steps, 0.083 correct) -- it decodes a non-waiting subtask instead, i.e. it knows it holds
+nothing; donor (both banks swapped) follows the donor content 24/24. Same commits (7.15 per
+window, all correct).
+
 **Did the memory parameters train in Stage 4c? (checkpoint diff 250 -> 999,
 `v4/diagnostics/memory_param_drift_v4.py`, log `param_drift_4c_r1_250_999.log`).**
 Visual bank: 30/36 leaves moved (Titans core, k/q/v projections, both query compressors,
