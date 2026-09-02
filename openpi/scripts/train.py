@@ -2548,7 +2548,9 @@ def main(config: _config.TrainConfig):
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if not _is_per_position_metric(k))
             label = "Completed update" if config.checkpoint_by_completed_updates else "Step"
             pbar.write(f"{label} {metric_step}: {info_str}")
-            wandb.log(reduced_info, step=metric_step)
+            # commit=True flushes this step now; with an explicit `step` wandb otherwise holds the
+            # row until the next (larger) step is logged, so the online view lagged one interval.
+            wandb.log(reduced_info, step=metric_step, commit=True)
             infos = []
 
         # Save v3.5 at the accepted-update boundary before drawing another batch. Since the

@@ -7,8 +7,15 @@ the Pi0.5 base weights are fetched by the trainer from `gs://openpi-assets`).
 ```bash
 git clone git@github.com:ZJU-Walker/memory_project_v4.git
 cd memory_project_v4
-WANDB=0 bash openpi/cluster_v4/coauthor/run_all.sh          # env -> data -> training
+bash openpi/cluster_v4/coauthor/run_all.sh                  # env -> data -> training
 ```
+
+Weights & Biases logging is on by default. The training step asks for your API key once
+(https://wandb.ai/authorize; or export `WANDB_API_KEY`, or run `openpi/.venv/bin/wandb login`
+beforehand; `WANDB=0` disables logging). Runs land in project `openpi` of the team
+`kewalk-stanford-university` (https://wandb.ai/kewalk-stanford-university/openpi) once you are
+a member of that team; otherwise they go to your own entity and the run URL is printed in the
+first lines of the training log. Metrics every 100 updates, camera views at step 0.
 
 `run_all.sh` is three idempotent steps you can also run one at a time:
 
@@ -20,7 +27,8 @@ WANDB=0 bash openpi/cluster_v4/coauthor/run_all.sh          # env -> data -> tra
 
 Knobs (environment variables): `GPUS` (default 8; must divide 2048, never 3), `BATCH`
 (default 16 = 2 per GPU; use 8 on 40 GB GPUs), `CONFIG` (default `pi05_yam_mem_v4_stage4d`),
-`EXP` (experiment name), `WANDB=1` (needs `wandb login` first; project `openpi`).
+`EXP` (experiment name), `WANDB` (default 1), `WANDB_ENTITY` (default
+`kewalk-stanford-university`).
 
 What the run is: Stage 4d of the v4 recipe -- Pi0.5 base + a semantic fact bank (the fact
 head grafted from the Stage-1 checkpoint) + a visual Titans bank, both banks allowed to

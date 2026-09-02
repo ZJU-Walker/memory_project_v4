@@ -112,7 +112,7 @@ def main() -> None:
             "",
             "```bash",
             "git clone git@github.com:ZJU-Walker/memory_project_v4.git && cd memory_project_v4",
-            "bash openpi/cluster_v4/coauthor/run_all.sh   # env -> data -> 8-GPU training",
+            "bash openpi/cluster_v4/coauthor/run_all.sh   # env -> data -> 8-GPU training (asks for a W&B key; WANDB=0 to skip)",
             "```",
             "",
         ]
