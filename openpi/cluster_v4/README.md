@@ -475,6 +475,32 @@ between the two runs of the same checkpoint, 0.938 vs 0.917, is bf16 nondetermin
 borderline windows). Remaining ckpt-999 runs (gate battery semantic / visual, both-bank
 side-flip) and the ckpt-500 set are appended when they land.
 
+Both-bank side-flip ckpt-999 (12:49): first step normal 0.854 / both-reset 0.354 / donor
+flip 22/24 = 0.917, follows-content 0.875 (all steps 0.865 / 0.678 / 0.754 / 0.817) --
+wiping or swapping BOTH banks behaves like the semantic bank alone, as it should.
+
+**Run-to-run nondeterminism found (12:55) -- under investigation.** The three ckpt-999
+side-flip runs (semantic / visual / both) scored the SAME 48 windows and 230 decision steps
+(sides and fact labels match record by record), and their `normal` condition is the same
+computation, yet its D differs across runs: bimodal -- 150/230 steps within 0.05 nats, but
+19–23 steps by 10–24 nats with sign flips, window-coherent (13–15 of 48 windows carry every
+large delta; e.g. window (2,1): D_normal +8.8 / -11.2 / -11.2 across the three runs, window
+(7,3): -11.2 / +8.8 / -11.2). First-step normal accuracy therefore reads 0.938 / 0.917 /
+0.854 for one checkpoint on one dataset. The magnitude and window coherence say a DISCRETE
+event flips -- most likely which fact the head commits on the window's E step (the
+confidence gate `memory_fact_write_conf` or the delta commit gate sitting near threshold),
+amplified by GPU nondeterminism (XLA autotuning picks different GEMM algorithms per
+process; bf16 accumulation order). Reset-condition numbers are identical across runs
+(0.354 = 17/48 each time), as expected for a bank-independent read. Probe queued on the
+H100 behind the ckpt-500 batteries (`run_after_batteries_4c_r1.sh`): re-run the semantic
+side-flip plain (`side_flip_4c_r1_999_semantic_rerun/`) and with
+`XLA_FLAGS=--xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0`
+(`..._det/`); if the deterministic run reproduces itself while the plain rerun differs
+again, the fragility is numerical and the fix is on the write path (a margin on the
+commit gate / hysteresis, or FP32 for the head + commit decision), not in the data. Until
+then the honest ckpt-999 first-step normal accuracy is "0.85–0.94 depending on the run" and
+6/48 windows are coin flips between runs.
+
 Gate battery (`v4_stage2_eval.py --bank semantic`) ckpt-999, 12:35: read side perfect and
 causal (read acc 0.987 normal / 0.500 reset / 0.498 donor), `sem_commits` 342 over 48
 windows = 7.1 per window (Stage 4 r1 had 1023 -- the commit anomaly is gone), decision CE
