@@ -135,6 +135,13 @@ def main(argv=None) -> None:
         help="which bank the reset/donor interventions act on (Stage 4: 'visual' shows whether "
         "the decision survives losing the visual bank; 'both' removes all memory).",
     )
+    parser.add_argument(
+        "--state-mask-prob",
+        type=float,
+        default=None,
+        help="override Pi0Config.memory_state_mask_prob (0 = state digits visible, the deployment view; "
+        "1 = the v3.4 null-state view; default = the config's per-window unseeded draw).",
+    )
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
     intervention_prefix = "" if args.bank == "semantic" else f"{args.bank}_"
@@ -157,6 +164,10 @@ def main(argv=None) -> None:
             base_config=dataclasses.replace(config.data.base_config, memory_manifest_split=args.split),
         ),
     )
+    if args.state_mask_prob is not None:
+        config = dataclasses.replace(
+            config, model=dataclasses.replace(config.model, memory_state_mask_prob=args.state_mask_prob)
+        )
     params = model_lib.restore_params(args.params, restore_type=np.ndarray)
     parameter_tree_sha256 = weight_loaders.parameter_tree_sha256(params)
     model = config.model.load(params)
@@ -225,6 +236,7 @@ def main(argv=None) -> None:
         "intervention_bank": args.bank,
         "batches": args.batches,
         "batch_size": args.batch_size,
+        "state_mask_prob": float(getattr(config.model, "memory_state_mask_prob", 0.0)),
         "sequences": int(all_sides.shape[0]),
         "sides_left_right": [int(np.sum(all_sides == 0)), int(np.sum(all_sides == 1))],
         "donor_mismatched_pair_fraction": mismatch,

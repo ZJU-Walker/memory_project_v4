@@ -94,10 +94,23 @@ def summarize(records: list[dict], *, first_step_only: bool = False) -> dict:
         out["donor_side_accuracy_matched"] = float(np.mean(d > 0))  # donor implies the SAME side
     # Content-following rate over every usable donor step: names the donor-implied side.
     if usable:
-        follows = [
-            (r["D_donor"] < 0) if r["donor_mismatched"] else (r["D_donor"] > 0) for r in usable
-        ]
+        follows = [(r["D_donor"] < 0) if r["donor_mismatched"] else (r["D_donor"] > 0) for r in usable]
         out["donor_follows_content_rate"] = float(np.mean(follows))
+    # Per-view breakdown of the v3.4 state-mask draw (None when the data carries no draw).
+    masked = [r for r in valid if r.get("state_masked") is True]
+    visible = [r for r in valid if r.get("state_masked") is False]
+    if masked or visible:
+        out["state_masked_steps"] = len(masked)
+        out["state_visible_steps"] = len(visible)
+        for name, group in (("state_masked", masked), ("state_visible", visible)):
+            if not group:
+                continue
+            out[f"normal_side_accuracy_{name}"] = float(np.mean([r["D_normal"] > 0 for r in group]))
+            usable_group = [r for r in group if r.get("donor_expected_valid", True)]
+            if usable_group:
+                out[f"donor_follows_content_rate_{name}"] = float(
+                    np.mean([(r["D_donor"] < 0) if r["donor_mismatched"] else (r["D_donor"] > 0) for r in usable_group])
+                )
     # Legacy pairing by the donor's own TARGET side (what the first report used).
     if any("donor_target_mismatched" in r for r in valid):
         t_mis = [r for r in valid if r["donor_target_mismatched"]]
@@ -133,6 +146,15 @@ def main(argv=None) -> None:
         "still uses the semantic expectation (the visual bank carries no labelled fact), so "
         "read its numbers as: does the decision SURVIVE losing / swapping the visual bank?",
     )
+    parser.add_argument(
+        "--state-mask-prob",
+        type=float,
+        default=None,
+        help="override Pi0Config.memory_state_mask_prob for this evaluation: 0 = state digits always "
+        "visible (the deployment view), 1 = always replaced by the learned null (the v3.4 masked view). "
+        "Default = the config's value (0.5 in v4), which the data pipeline draws PER WINDOW with an "
+        "unseeded np.random, so two runs score different mixes of the two views.",
+    )
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
     intervention_prefix = "" if args.bank == "semantic" else f"{args.bank}_"
@@ -155,6 +177,11 @@ def main(argv=None) -> None:
             base_config=dataclasses.replace(config.data.base_config, memory_manifest_split=args.split),
         ),
     )
+    if args.state_mask_prob is not None:
+        config = dataclasses.replace(
+            config, model=dataclasses.replace(config.model, memory_state_mask_prob=args.state_mask_prob)
+        )
+    state_mask_prob = float(getattr(config.model, "memory_state_mask_prob", 0.0))
     params = model_lib.restore_params(args.params, restore_type=np.ndarray)
     parameter_tree_sha256 = weight_loaders.parameter_tree_sha256(params)
     model = config.model.load(params)
@@ -176,6 +203,13 @@ def main(argv=None) -> None:
         actions = actions[perm]
         sides = sides[perm]
         batch = sides.shape[0]
+        # v3.4 plan-5.2 state-mask draw (per window, unseeded in the data pipeline): which
+        # VIEW of the window this run scored. Recorded so runs can be compared view by view.
+        state_masked = (
+            None
+            if observation.seq_state_masked is None
+            else np.asarray(jax.device_get(observation.seq_state_masked)).astype(bool)
+        )
         # The model's donor intervention is jnp.roll(state, 1, axis=0): sequence b reads b-1.
         donor_sides = np.roll(sides, 1)
         # The bank stores OBJECT facts (slot 0 banana, slot 1 grey_pepper_box; always on
@@ -236,10 +270,13 @@ def main(argv=None) -> None:
                     "decision_tokens": int(token_count[b, t]),
                     "has_side_token": bool(has_side[b, t]),
                     "included": included,
+                    "state_masked": None if state_masked is None else bool(state_masked[b]),
                 }
                 for cond in CONDITIONS:
                     # mean-token CE difference x token count = log p(true) - log p(swapped)
-                    record[f"D_{cond}"] = float((ce[(cond, "swap")][b, t] - ce[(cond, "true")][b, t]) * token_count[b, t])
+                    record[f"D_{cond}"] = float(
+                        (ce[(cond, "swap")][b, t] - ce[(cond, "true")][b, t]) * token_count[b, t]
+                    )
                     record[f"ce_true_{cond}"] = float(ce[(cond, "true")][b, t])
                     record[f"ce_swap_{cond}"] = float(ce[(cond, "swap")][b, t])
                 records.append(record)
@@ -278,6 +315,15 @@ def main(argv=None) -> None:
                 f"  donor FOLLOWS-CONTENT rate (names the donor-implied side, all usable steps="
                 f"{s['donor_expected_valid']})={s['donor_follows_content_rate']:.3f}"
             )
+        if "state_masked_steps" in s:
+            print(
+                f"  state-mask view: masked steps={s['state_masked_steps']} "
+                f"(normal acc={s.get('normal_side_accuracy_state_masked', float('nan')):.3f}, "
+                f"follows={s.get('donor_follows_content_rate_state_masked', float('nan')):.3f}) | "
+                f"visible steps={s['state_visible_steps']} "
+                f"(normal acc={s.get('normal_side_accuracy_state_visible', float('nan')):.3f}, "
+                f"follows={s.get('donor_follows_content_rate_state_visible', float('nan')):.3f})"
+            )
         if "legacy_target_flip_rate_mismatched" in s:
             print(
                 f"  [legacy target-side pairing] flip_rate_mismatched="
@@ -301,6 +347,7 @@ def main(argv=None) -> None:
         "intervention_bank": args.bank,
         "batches": args.batches,
         "batch_size": args.batch_size,
+        "state_mask_prob": state_mask_prob,
         "parameter_tree_sha256": parameter_tree_sha256,
         "summary": summary,
         "summary_first_decision_step": summary_first,

@@ -524,6 +524,23 @@ between the same two values ((2,1) +8.8 -> -11.0, (7,0) +9.7 -> -12.4, (7,3) -11
 -- expected, since the flags change the kernels; only `_det` vs `_det2` answers the
 reproducibility question.
 
+**Suspect identified (14:35): the v3.4 state-mask draw, not GPU numerics.** The v4 base
+config still carries `memory_state_mask_prob=0.5` (plan 5.2: replace the state-digit
+embeddings with a learned null for the whole window). `transforms.py` draws it PER WINDOW
+with an UNSEEDED `np.random.random()` in every split, and `_compute_sequence_loss_v32`
+honours `seq_state_masked` in eval too. So every sequence battery scored a random 50/50
+mix of the "state visible" and "state nulled" views of each window, and two runs disagree
+on about half of the mask-sensitive windows. That reproduces every symptom: window-coherent
+flips (one draw per window), two attractor values per window (the two views), the
+reset-condition drift (the whole forward changes under the null), and the closed loop being
+perfect (it never nulls the state). The `_det`/`_det2` pair will also differ (different
+draws). Test queued (`run_statemask_4c_r1.sh`, after det2): `v4_side_flip_eval.py` now
+takes `--state-mask-prob` (0 = deployment view, 1 = null view; default = the config draw)
+and records `state_masked` per record with a per-view summary; two runs at 0 must agree
+record by record and match the closed loop, and the run at 1 should hold the weak windows.
+`v4_stage2_eval.py` takes the same flag. If confirmed, the fix is evaluation-side (score
+the deployment view; the null view is a training regulariser) plus seeding the draw.
+
 ckpt-500 semantic side-flip (13:13): first step normal 0.375 (+0.14 nats), reset 0.500,
 follows-content 0.500; all steps normal 0.643, reset 0.713, follows-content 0.487 -> at
 step 500 Stage 4c does not use the semantic bank yet (2b's ckpt-500 was at 0.77): the live
@@ -596,7 +613,31 @@ the same set the sequence batteries score) it records, per condition normal / re
 Headline: free-decode side accuracy per condition and the donor FOLLOWS-CONTENT rate (free
 and D). Agreement with the sequence batteries = the deployment path (cache layout, greedy
 decode, own-head writes) carries the same memory use; disagreement isolates a train/inference
-mismatch. Cost: 1 call per step + 8 extra calls per decision step (batch 4). Runner
+mismatch.
+
+**Closed-loop result, ckpt-999, semantic bank (14:27, `closed_loop_4c_r1_999_semantic/`,
+32 min on the H100 incl. compile):**
+
+| deployment path, 48 dev windows | first decision step (48) | all decision steps (230) |
+|---|---|---|
+| normal: free-decoded side correct | **1.000** (D +11.5 nats) | **1.000** (D +14.0) |
+| semantic bank wiped | 0.396 (D acc 0.354) | 0.448 (D acc 0.639) |
+| donor bank: names the donor-implied side (free decode) | **1.000** (24/24 flips) | **1.000** (114/114 flips) |
+| donor: follows content by D | 1.000 | 0.922 |
+| read head correct on committed real slots | 1.000 (96 terms) | 1.000 (460 terms) |
+
+Windows: 7.15 commits per window = 7.15 eligible (no degenerate commits), commit write
+accuracy 1.000 (every committed fact was the true fact), head argmax on observable real
+slots 0.969 (the 0.9 confidence gate filters the misses), action MSE 0.027 normalized (sanity
+only). No decoded string lacked a side word.
+
+Reading: on the INFERENCE path the Stage-4c policy is perfect on the development split and
+strictly better than the sequence-path batteries (0.85–0.94 normal, 0.88–0.96
+follows-content). The deployment path therefore carries the memory use; the fragile windows
+belong to the sequence-path evaluation, not to the policy. Two candidate reasons, checked
+below: the sequence path evaluates the v3.4 state-masked view for windows whose
+`seq_state_masked` draw is true (the closed loop never nulls the state digits), and
+the run-to-run numerical flips. Cost: 1 call per step + 8 extra calls per decision step (batch 4). Runner
 `v4/diagnostics/run_closed_loop_4c_r1.sh` (queued on the H100 job behind the sequence
 batteries; ckpt-999 semantic / visual / both -> `closed_loop_4c_r1_999_<bank>/`,
 status `closed_loop_4c_r1_status.log`). Pure-function tests: `v4_closed_loop_eval_test.py`.
