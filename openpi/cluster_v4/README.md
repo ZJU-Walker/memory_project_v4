@@ -540,6 +540,11 @@ and records `state_masked` per record with a per-view summary; two runs at 0 mus
 record by record and match the closed loop, and the run at 1 should hold the weak windows.
 `v4_stage2_eval.py` takes the same flag. If confirmed, the fix is evaluation-side (score
 the deployment view; the null view is a training regulariser) plus seeding the draw.
+**Confirmed (15:53, `side_flip_4c_r1_999_semantic_nomask1/`, state mask off):** first-step
+normal 1.000 (+11.5 nats), reset 0.354, donor flip 24/24, follows-content 1.000 -- identical
+to the closed-loop deployment path. The 0.85–0.94 figures of the earlier sequence batteries
+were the null-state view's share of each run's coin flips. All future sequence batteries
+run with `--state-mask-prob 0`.
 
 ckpt-500 semantic side-flip (13:13): first step normal 0.375 (+0.14 nats), reset 0.500,
 follows-content 0.500; all steps normal 0.643, reset 0.713, follows-content 0.487 -> at
