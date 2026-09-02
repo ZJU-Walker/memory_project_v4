@@ -734,6 +734,41 @@ eval job shares the GPU, well inside the 500 ms tick. Observed quirk: during the
 empty bank; the actions in that phase still track the recorded opening motion (RMSE 0.06),
 so it is a text-label lag, but watch the arm at episode start on the robot.
 
+**Robot trial 1 (user, 15:40) and Stage 4d.** Findings on the YAM with the Stage-4c server
+(`--write-policy always`): (1) the pick-up motion is poor; (2) the policy does not start
+with "open both lids" -- it decodes "wait; target bin is left/right" at the start pose,
+then either keeps waiting or opens the guessed lid; (3) the memory writes on every tick,
+unlike training. Diagnosis: (3) is real for the VISUAL bank only (training committed it on
+manifest evidence frames; the semantic bank is gated per slot by the head's confidence
+either way) and is the main cause of (2): with the visual bank already written, the start
+pose (lids closed, arms at rest) reads as the post-inspection waiting state; the offline
+both-banks-blank battery decoded a non-waiting subtask 44/48, and the dev replays showed
+the early "wait ... right" text under the always policy. (1) is training budget: Stage 4c
+is 1000 updates x batch 2 from the generic `pi05_base` (graft manifest), i.e. ~2000 windows
+for the action head. Decision (user): retrain from the base the way it is deployed.
+
+Two implementations, commit `11d2630`:
+- Stopgap for evidence-only checkpoints: `sample_with_memory(v4_write_mask_from_head=True)`
+  ANDs the caller's write mask with the head's eligibility for BOTH banks; the server's
+  `--write-policy head` (v4 default) uses it, so the visual bank only commits where the head
+  sees a fact (the training schedule without a manifest). Unit-tested; a server with it was
+  started on 8001 at 15:45 but not replayed before the GPU went to training.
+- **Stage 4d** `pi05_yam_mem_v4_stage4d`: Stage 4c + `memory_write_every_step=True`
+  (`DataConfig` -> `MemoryV34Labels.write_every_step`: `seq_write_mask` = every valid step;
+  read-state validity, credit reachability and the D-anchor checks keep the evidence
+  definition, so decision supervision is unchanged; skip-O windows keep their gaps, whose
+  guard now uses the evidence mask) + `memory_slice_prob` 0.4 (frame-0 windows 25% -> 30%) +
+  6000 updates, checkpoints every 500. Pipeline check on CPU: write mask == step mask on
+  dense and skip-O windows, every decision step anchored. **Launched 2026-09-02 15:58** on
+  the 1-H100 job 17192955 after killing the remaining eval queue and the test server:
+  `WANDB=1 v4/diagnostics/run_train_1gpu.sh pi05_yam_mem_v4_stage4d v4_stage4d_20260902_r1`
+  (batch 2, wandb project "openpi", auto-resume on preemption); logs
+  `v4/diagnostics/train_v4_stage4d_20260902_r1{.log,_status.log}`; expected ~10 s/update
+  -> ~17 h; checkpoints under `v4/checkpoints/pi05_yam_mem_v4_stage4d/v4_stage4d_20260902_r1/`.
+  Serve it with `--write-policy always` (training == deployment). Evaluate with the
+  closed-loop battery `--write-policy always` and the side-flip battery
+  `--state-mask-prob 0`.
+
 Robot-trial runbook (v4):
 
 1. GPU box (inside the SLURM job that owns the H100; the evaluation queue must be killed
