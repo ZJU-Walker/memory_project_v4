@@ -473,14 +473,55 @@ adding a live, unsupervised visual bank: first-step normal accuracy 1.000 -> 0.9
 follows-content 1.000 -> 0.96 (2-3 windows of 48; the small normal-accuracy difference
 between the two runs of the same checkpoint, 0.938 vs 0.917, is bf16 nondeterminism on
 borderline windows). Remaining ckpt-999 runs (gate battery semantic / visual, both-bank
-side-flip) and the ckpt-500 set are appended when they land. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
-ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
-`v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
+side-flip) and the ckpt-500 set are appended when they land.
 
-Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
-`memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception
-error; then dual-bank inference (`sample_with_memory`) for sampled-action interventions, then
-Stage 4 (both banks).
+Gate battery (`v4_stage2_eval.py --bank semantic`) ckpt-999, 12:35: read side perfect and
+causal (read acc 0.987 normal / 0.500 reset / 0.498 donor), `sem_commits` 342 over 48
+windows = 7.1 per window (Stage 4 r1 had 1023 -- the commit anomaly is gone), decision CE
+2.074 normal / 2.092 reset / 2.251 donor (ratios 1.009 / 1.085 -> the old CE-ratio gate
+says PASS=False exactly as it did for 2a/2b; that gate averages side-free strings and is
+superseded by the side-flip battery, see the 2a postmortem above).
+
+**Dual-bank `sample_with_memory` (2026-09-02, while the 4c batteries ran).** Until now a
+v4 model raised `NotImplementedError` from `Pi0.sample_with_memory`, so every v4 verdict
+came from the teacher-forced sequence path (`_compute_sequence_loss_v32`) and no
+closed-loop / action-level use of the semantic bank could be measured. Change (pi0.py,
+additive; v3.x callers untouched):
+
+- `sample_with_memory(..., semantic_state=None, v4_oracle_targets=None, v4_oracle_slot_mask=None)`.
+  A dual-bank model REQUIRES `semantic_state` (start from `memory_semantic.init_state(b)`);
+  a non-v4 model rejects it. The return signature is unchanged (actions, visual state,
+  aux); the transitioned semantic bank comes back as `aux["v4_semantic_state"]` and must be
+  threaded into the next call.
+- Both banks share the v3.5 clock (`v35_transition_valid` / `v35_write_mask` /
+  `write_mode`). Semantic transition = training's `v4_semantic_write` contract exactly:
+  valid + normal + write-masked step -> one decay + commit of the memory-blind head's
+  confident non-`unknown` slots (content = this step's layer-8 states); valid step without
+  a normal write -> one decay; invalid or `frozen` -> exact no-op. Computed after the
+  step's reads, like the scan. The unit test checks the sampled transition is bitwise
+  equal to `v4_semantic_write` on the same logits.
+- `v4_oracle_targets` + `v4_oracle_slot_mask` supply Stage-2a oracle content instead of
+  the head's prediction; a checkpoint trained with `memory_fact_oracle_writes` refuses to
+  sample without them (fail loudly rather than silently switch the writer).
+- aux additions: `v4_semantic_state`, `v4_sem_transition_applied`,
+  `v4_sem_commit_applied` [b,F], `v4_fact_logits/predicted/confidence/write_eligible`
+  (write side), `v4_sem_retrieved` [b,F,dv] and `v4_fact_read_logits` [b,F,T] (read side,
+  pre-transition bank, for closed-loop read accuracy), `v4_sem_injected_{pre,post}_cast_rms`.
+- Test: `pi0_v4_test.py::test_v4_sample_with_memory_threads_the_semantic_bank` (required
+  state, no-op without phase metadata, commit == training transition, read-back of the
+  committed slot, frozen mode, oracle content, oracle-model refusal).
+
+Not yet done: `scripts/eval_yam_mem_subtask_raw.py` still threads only the visual state;
+a v4 closed-loop replay needs the semantic state threaded through it (and the phase
+controller's E-frame write mask, as v3.5 does).
+
+Historical (2b-era) plan, kept for the record: battery plan for 2b = `v4_stage2_eval.py`
++ `v4_side_flip_eval.py` on ckpt 500/999; the 2a/2b gap = perception error of the
+predicted write path (watch `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the
+log for the write rate). Next after 2a's battery: Stage 2b (predicted writes replace the
+oracle: flip `memory_fact_oracle_writes=False`, unfreeze nothing else); then dual-bank
+inference (`sample_with_memory`) for sampled-action interventions, then Stage 4 (both
+banks). All three happened (2b PASS, Stage 4c PASS, sampler above).
 
 Historical (superseded) next-steps:
 1. (done) Confirm at ckpt-1000, freeze the Stage-1 artifact.
@@ -489,5 +530,6 @@ Historical (superseded) next-steps:
    (single GPU; wait for training to finish or use another machine).
 2. Decision point on the battery gates. Only on full PASS: per-bank injection calibration,
    then Stage 2a (oracle semantic writes) per §5/§6.
-3. Still open: dual-bank `sample_with_memory` (raises NotImplementedError until Stage 2),
-   cluster_v4 gate-pipeline clone (§6), per-bank run-identity record for calibrated pilots.
+3. (sampler done 2026-09-02, see above) dual-bank `sample_with_memory`; still open:
+   cluster_v4 gate-pipeline clone (§6), per-bank run-identity record for calibrated pilots,
+   v4 closed-loop replay in `eval_yam_mem_subtask_raw.py`.

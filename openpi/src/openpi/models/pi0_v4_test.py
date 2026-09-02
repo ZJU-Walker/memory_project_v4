@@ -519,3 +519,94 @@ def test_mask_zero_tokens_hides_blank_slots_and_cuts_their_gradient(tiny_v4_seq)
     np.testing.assert_array_equal(losses["v4_fact_read_count"], 2.0)
     for key, value in losses.items():
         assert np.isfinite(np.asarray(value)).all(), key
+
+
+def test_v4_sample_with_memory_threads_the_semantic_bank(tiny_v4_seq):
+    """Dual-bank inference: the semantic bank is required, follows the v3.5 clock, commits
+    the head's confident slots on a normal write-masked step exactly like training's
+    transition, and is read back on the next call."""
+    observation = _single_observation()
+    visual = tiny_v4_seq.memory.init_state(1)
+    semantic = tiny_v4_seq.memory_semantic.init_state(1)
+    kwargs = {
+        "stop_token": 1,
+        "max_decode_steps": 1,
+        "num_steps": 1,
+        "noise": jnp.zeros((1, 4, 2), dtype=jnp.float32),
+        "forced_subtask_tokens": jnp.asarray([[5, 6]], dtype=jnp.int32),
+        "forced_subtask_mask": jnp.ones((1, 2), dtype=bool),
+    }
+    with pytest.raises(ValueError, match="semantic_state"):
+        tiny_v4_seq.sample_with_memory(jax.random.key(1), observation, visual, **kwargs)
+
+    # No phase metadata: exact no-op on both banks; a fresh bank reads exactly zero.
+    _, visual_same, aux = tiny_v4_seq.sample_with_memory(
+        jax.random.key(1), observation, visual, semantic_state=semantic, **kwargs
+    )
+    jax.tree.map(np.testing.assert_array_equal, visual_same, visual)
+    jax.tree.map(np.testing.assert_array_equal, aux["v4_semantic_state"], semantic)
+    np.testing.assert_array_equal(np.asarray(aux["v4_sem_transition_applied"]), [False])
+    np.testing.assert_array_equal(np.asarray(aux["v4_sem_commit_applied"]), [[False, False, False]])
+    np.testing.assert_array_equal(np.asarray(aux["v4_sem_retrieved"]), 0.0)
+    assert aux["v4_fact_read_logits"].shape == (1, 3, 3)
+    assert aux["tokens"].shape == (1, tiny_v4_seq.causal_token_len)
+
+    # A valid, write-masked E step commits every confident slot (the tiny head predicts
+    # target 0 on all three at confidence ~1) and returns the transitioned bank, bitwise
+    # equal to the training-side transition on the same logits.
+    _, _, commit_aux = tiny_v4_seq.sample_with_memory(
+        jax.random.key(1),
+        observation,
+        visual,
+        semantic_state=semantic,
+        v35_transition_valid=True,
+        v35_write_mask=True,
+        **kwargs,
+    )
+    np.testing.assert_array_equal(np.asarray(commit_aux["v4_sem_commit_applied"]), [[True, True, True]])
+    np.testing.assert_array_equal(np.asarray(commit_aux["v4_fact_predicted"]), [[0, 0, 0]])
+    committed = commit_aux["v4_semantic_state"]
+    expected, _ = tiny_v4_seq.v4_semantic_write(semantic, commit_aux["v4_fact_logits"], jnp.asarray([True]))
+    jax.tree.map(np.testing.assert_array_equal, committed, expected)
+
+    # The next call reads the committed content back (last-committed slot exact) and a
+    # frozen transition leaves the bank untouched even with the write masks asserted.
+    _, _, read_aux = tiny_v4_seq.sample_with_memory(
+        jax.random.key(1),
+        observation,
+        visual,
+        semantic_state=committed,
+        write_mode="frozen",
+        v35_transition_valid=True,
+        v35_write_mask=True,
+        **kwargs,
+    )
+    jax.tree.map(np.testing.assert_array_equal, read_aux["v4_semantic_state"], committed)
+    written = tiny_v4_seq.v4_fact_write_intent(commit_aux["v4_fact_logits"])["values"]
+    retrieved = read_aux["v4_sem_retrieved"]
+    cosine = jnp.sum(retrieved * written, axis=-1) / jnp.maximum(jnp.linalg.norm(retrieved, axis=-1), 1e-6)
+    assert float(cosine[0, 2]) > 0.99
+    assert float(read_aux["v4_sem_injected_pre_cast_rms"][0]) > 0.0
+
+    # Oracle content at inference commits only the masked real slots.
+    _, _, oracle_aux = tiny_v4_seq.sample_with_memory(
+        jax.random.key(1),
+        observation,
+        visual,
+        semantic_state=semantic,
+        v35_transition_valid=True,
+        v35_write_mask=True,
+        v4_oracle_targets=jnp.asarray([[0, 1, 2]], dtype=jnp.int32),
+        v4_oracle_slot_mask=jnp.asarray([[True, True, True]]),
+        **kwargs,
+    )
+    np.testing.assert_array_equal(np.asarray(oracle_aux["v4_sem_commit_applied"]), [[True, True, False]])
+    np.testing.assert_array_equal(np.asarray(oracle_aux["v4_fact_predicted"]), [[0, 1, 2]])
+
+    # An oracle-trained (Stage 2a) model refuses to sample without oracle content.
+    tiny_v4_seq.memory_fact_oracle_writes = True
+    try:
+        with pytest.raises(ValueError, match="oracle"):
+            tiny_v4_seq.sample_with_memory(jax.random.key(1), observation, visual, semantic_state=semantic, **kwargs)
+    finally:
+        tiny_v4_seq.memory_fact_oracle_writes = False

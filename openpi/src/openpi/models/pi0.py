@@ -3530,6 +3530,9 @@ class Pi0(_model.BaseModel):
         v35_anchor_key: at.Float[at.Array, "b dk"] | None,
         v35_anchor_value: at.Float[at.Array, "b dv"] | None,
         v35_anchor_delay_steps: int | at.Int[at.Array, " b"] | None,
+        semantic_state: _memory.MemoryState | None = None,
+        v4_oracle_targets: at.Int[at.Array, "b f"] | None = None,
+        v4_oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens.
 
@@ -3573,7 +3576,9 @@ class Pi0(_model.BaseModel):
             state_token_mask=preprocessed.token_state_mask,
             v35_oracle_direction=v35_oracle_direction,
             v35_oracle_injected_rms=v35_oracle_injected_rms,
+            semantic_state=semantic_state,
         )
+        v4_on = getattr(self, "memory_v4_dual_bank", False)
         kv_cache = prepared["cache"]
         final_prefix = prepared["final_prefix"]
         write_tokens = prepared["write_tokens"]
@@ -3617,8 +3622,55 @@ class Pi0(_model.BaseModel):
                     **write_aux,
                     "write_occurred": jnp.full((batch,), write_mode == "normal", dtype=bool),
                 }
+            v4_aux: dict[str, at.Array] = {}
+            if v4_on:
+                # Semantic-bank transition on the same E-only, fail-closed clock as the visual
+                # bank above (training's v4_semantic_write contract): a valid normal write-
+                # masked step decays once and commits the confident eligible slots; a valid
+                # step without a normal write decays only; an invalid / frozen step is an
+                # exact no-op. Content = the memory-blind head on THIS step's layer-8 states
+                # (or the oracle labels when given). Computed after the reads, like training.
+                transition_valid_mask = self._v35_inference_mask(
+                    v35_transition_valid, batch_size=batch, name="v35_transition_valid"
+                )
+                write_eligible = self._v35_inference_mask(v35_write_mask, batch_size=batch, name="v35_write_mask")
+                transition_applied = transition_valid_mask & (write_mode != "frozen")
+                sem_write_requested = transition_applied & write_eligible & (write_mode == "normal")
+                fact_logits = self.v4_fact_logits(prepared["h8_top"])
+                if v4_oracle_targets is not None:
+                    sem_candidate, sem_aux = self.v4_semantic_write(
+                        semantic_state,
+                        fact_logits,
+                        sem_write_requested,
+                        oracle_targets=v4_oracle_targets,
+                        oracle_slot_mask=v4_oracle_slot_mask,
+                    )
+                else:
+                    sem_candidate, sem_aux = self.v4_semantic_write(semantic_state, fact_logits, sem_write_requested)
+                new_semantic_state = jax.tree.map(
+                    lambda new, old: jnp.where(transition_applied.reshape((batch,) + (1,) * (new.ndim - 1)), new, old),
+                    sem_candidate,
+                    semantic_state,
+                )
+                sem_retrieved = prepared["sem_retrieved"]
+                v4_aux = {
+                    "v4_semantic_state": new_semantic_state,
+                    "v4_sem_transition_applied": transition_applied,
+                    "v4_sem_commit_applied": sem_aux["commit_applied"] & transition_applied[:, None],
+                    "v4_fact_logits": fact_logits,
+                    "v4_fact_predicted": sem_aux["fact_predicted"],
+                    "v4_fact_confidence": sem_aux["fact_confidence"],
+                    "v4_fact_write_eligible": sem_aux["fact_write_eligible"],
+                    # Read side of this step (pre-transition bank): raw slot retrieval and the
+                    # read head's per-slot fact logits, for closed-loop read-accuracy tracking.
+                    "v4_sem_retrieved": sem_retrieved,
+                    "v4_fact_read_logits": self.v4_fact_read_logits(sem_retrieved),
+                    "v4_sem_injected_pre_cast_rms": prepared["sem_injected_pre_cast_rms"],
+                    "v4_sem_injected_post_cast_rms": prepared["sem_injected_post_cast_rms"],
+                }
             aux = {
                 **write_aux,
+                **v4_aux,
                 "tokens": tokens,
                 "token_mask": token_mask,
                 "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
@@ -3795,8 +3847,22 @@ class Pi0(_model.BaseModel):
         v35_anchor_key: at.Float[at.Array, "b dk"] | None = None,
         v35_anchor_value: at.Float[at.Array, "b dv"] | None = None,
         v35_anchor_delay_steps: int | at.Int[at.Array, " b"] | None = None,
+        semantic_state: _memory.MemoryState | None = None,
+        v4_oracle_targets: at.Int[at.Array, "b f"] | None = None,
+        v4_oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
+
+        v4 dual-bank models additionally REQUIRE ``semantic_state`` (the semantic bank; start
+        from ``memory_semantic.init_state(batch)``). The returned ``memory_state`` is the
+        visual bank as before; the transitioned semantic bank comes back as
+        ``aux["v4_semantic_state"]`` and must be threaded into the next call. Both banks
+        share the v3.5 clock (``v35_transition_valid`` / ``v35_write_mask`` / ``write_mode``):
+        the semantic bank decays on every valid transition and commits the memory-blind
+        head's confident slots only on a valid, normal, write-masked step (training's
+        ``v4_semantic_write`` contract). ``v4_oracle_targets`` + ``v4_oracle_slot_mask``
+        replace the head's prediction with Stage-2a oracle content; a model trained with
+        ``memory_fact_oracle_writes`` refuses to sample without them.
 
         Static layout: [images 0..num_img | context text (positions unchanged) | memory tokens |
         generated subtask | action suffix]. The prefill is identical to the baseline path and
@@ -3834,12 +3900,23 @@ class Pi0(_model.BaseModel):
         per-query hidden-key cosine/beta, cancellation, and anchor-predicted read residuals.
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
-        if getattr(self, "memory_v4_dual_bank", False):
-            # Dual-bank inference (per-bank state threading, reset/donor-swap controls) lands
-            # with Stage 2. Until then, the trainable path is _compute_sequence_loss_v32 and
-            # the Stage-1 battery uses v4_fact_probe_step; failing here beats silently
-            # sampling with an absent semantic bank.
-            raise NotImplementedError("sample_with_memory does not support memory_v4_dual_bank yet (V4_PLAN.md §5).")
+        v4_on = getattr(self, "memory_v4_dual_bank", False)
+        if v4_on and semantic_state is None:
+            raise ValueError(
+                "memory_v4_dual_bank models require `semantic_state` at every sample_with_memory call "
+                "(start from memory_semantic.init_state(batch); thread aux['v4_semantic_state'] afterwards)."
+            )
+        if not v4_on and (semantic_state is not None or v4_oracle_targets is not None or v4_oracle_slot_mask is not None):
+            raise ValueError("semantic_state / v4_oracle_* were provided but this model has no semantic bank.")
+        if (v4_oracle_targets is None) != (v4_oracle_slot_mask is None):
+            raise ValueError("v4_oracle_targets and v4_oracle_slot_mask must be provided together.")
+        if v4_on and getattr(self, "memory_fact_oracle_writes", False) and v4_oracle_targets is None:
+            raise ValueError(
+                "this model was trained with oracle semantic writes (Stage 2a); pass v4_oracle_targets and "
+                "v4_oracle_slot_mask, or sample a predicted-write checkpoint."
+            )
+        if v4_on and getattr(self, "memory_architecture", "v3_v31") != "v32_layer8_dual_query":
+            raise ValueError("memory_v4_dual_bank inference requires the v3.2 dual-query architecture.")
         assert max_decode_steps <= self.causal_token_len
         if write_mode is None:
             write_mode = "normal" if allow_write else "frozen"
@@ -3866,6 +3943,9 @@ class Pi0(_model.BaseModel):
                 v35_anchor_key=v35_anchor_key,
                 v35_anchor_value=v35_anchor_value,
                 v35_anchor_delay_steps=v35_anchor_delay_steps,
+                semantic_state=semantic_state,
+                v4_oracle_targets=v4_oracle_targets,
+                v4_oracle_slot_mask=v4_oracle_slot_mask,
             )
         if any(
             value is not None
