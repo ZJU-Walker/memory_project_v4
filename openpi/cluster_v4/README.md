@@ -252,6 +252,43 @@ subtask target under a swapped bank must follow the bank), or re-check the dev d
 steps for side leakage (the 0.92-AUC wrist-camera leak was trimmed in v3.4, not proven
 absent on 0830/0831). Decide before Stage 2b.
 
+**Side-flip battery (2026-09-02, `scripts/v4_side_flip_eval.py`, commits `55b2117`..`71cc142`).**
+User framing: memory matters only at the static waiting/decision frame, so the "use" question
+is whether the SUBTASK DECISION there follows the memory content. The battery scores each
+decision step with the true string and the single-token side-swapped string
+(`▁left`=2731 / `▁right`=1833) under normal / reset / donor banks:
+D = log p(true) - log p(swapped); headline = donor FLIP RATE on mismatched-side pairs.
+Facts established while building it (dev split, 48 windows, `v4/diagnostics` decode):
+every window's first decision step carries `wait; target bin is <side>` (27 left / 21
+right); windows hold 2-3 decision steps (the last waiting frames plus the first
+`open <side> bin` label); the shifted CE label names the side one step BEFORE the waiting
+observation begins (44/48). The first battery version scored only windows with exactly one
+decision step and so reported 9/48 -- those 9 (ckpt-500, ws-18): normal side accuracy 1.000
+(+13.6 nats), reset 0.333 (-1.0 nats), donor mismatched flip rate 0.75 (3/4, -4.3 nats),
+donor matched 0.6. The per-step version (all decision steps + first-step view) is what
+runs from here; results are appended below when they land.
+
+**Launch decision rule (user instruction 2026-09-02 00:23: after the tests, resume/launch
+training on the 1-H100 job whatever the result; modifications allowed if documented; a
+fresh run is acceptable).** Single-H100 recipe = `v4/diagnostics/run_train_1gpu.sh <config>
+<exp>`: global batch 4 as micro-batch 2 x 2 accumulation (byte-identical objective to r3's
+2x2 FSDP), `--resume` automatically when the experiment directory already holds a
+checkpoint (the `iris` partition preempts; every relaunch resumes from the last 250-step
+save). Rule:
+* If the per-step side-flip shows the decision follows the content at full sample
+  (mismatched-pair flip rate >= 0.5 at ckpt-500 or ckpt-999), Stage 2a has done its job
+  (commit -> retain -> read -> use, with oracle writes) and the next run is **Stage 2b**:
+  `pi05_yam_mem_v4_stage2b` (commit `c849c3c`; differs from 2a in exactly
+  `memory_fact_oracle_writes=False`, verified by config diff), fresh from pi05_base + the
+  Stage-1 fact head, exp `v4_stage2b_20260902_r1`. The 2a/2b gap on both batteries is the
+  perception error of the predicted write path.
+* Otherwise the next run is a **resume of 2a r3 from ckpt-999** with `--num-train-steps
+  2000` (same recipe), because the small-sample flip result says the content path exists
+  and just needs more training, and the CE-ratio erosion is then a dilution artifact of
+  side-free later decision steps rather than a loss of content use.
+Either way the run is launched by the same script and documented here with its exp name,
+commit, and the exact command.
+
 Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
 `memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception
 error; then dual-bank inference (`sample_with_memory`) for sampled-action interventions, then
