@@ -2333,6 +2333,81 @@ _CONFIGS = [
                 num_workers=12,
                 fsdp_devices=1,
             ),
+            TrainConfig(
+                name="pi05_yam_mem_v4_stage4",
+                v4_protocol=True,
+                # Stage 4 (V4_PLAN.md §5): BOTH banks inject. Identical to Stage 2b (predicted
+                # semantic writes, frozen Stage-1 fact head, semantic bank at the pinned
+                # c=12.4 / gate 0.5) plus the VISUAL bank switched on: its retrieval is injected
+                # through the same tanh_rms form at the same residual constant c=12.4 (the
+                # max(rms, tau) normalisation makes the injected scale 0.5*c for any read with
+                # rms > tau, so one constant serves both banks), and the visual subsystem is
+                # UNFROZEN for the first time in v4 -- Titans core (`memory/`), read/write
+                # query compressors, the write-query conditioner and the v3.5 write/read side
+                # heads at the v3.5 side-loss weights (0.3/0.3). Gates of both banks, the fact
+                # head, SigLIP and the embedder stay frozen. Fresh from pi05_base + the Stage-1
+                # fact head, so the only difference from 2b is the visual bank going live.
+                model=dataclasses.replace(
+                    v4_model,
+                    memory_fact_oracle_writes=False,
+                    memory_v4_visual_injection=True,
+                    memory_fact_loss_weight=0.0,
+                    memory_fact_read_loss_weight=0.3,
+                    memory_sem_injection_c=12.4,
+                    memory_sem_injection_tau=0.02,
+                    memory_sem_injection_gate_init=0.5,
+                    memory_injection_c=12.4,
+                    memory_injection_tau=0.02,
+                    memory_injection_gate_init=0.5,
+                    memory_write_side_loss_weight=0.3,
+                    memory_read_side_loss_weight=0.3,
+                ),
+                data=v4_data,
+                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
+                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
+                freeze_filter=nnx_utils.PathRegex(
+                    r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed"
+                    r"|memory/gate|memory_gate|memory_inject_w|memory_sem_inject_w|memory_semantic/gate"
+                    r"|PaliGemma/img/|PaliGemma/llm/embedder).*"
+                ),
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=200,
+                    peak_lr=5e-5,
+                    decay_steps=10_000,
+                    decay_lr=5e-5,
+                ),
+                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+                memory_grad_clip=5.0,
+                ema_decay=None,
+                probe_lr=1e-2,
+                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+                    "gs://openpi-assets/checkpoints/pi05_base/params",
+                    matched_allowlist=(
+                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+                    ),
+                    fresh_init_allowlist=(
+                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+                    ),
+                ),
+                v4_graft_sources=(
+                    (
+                        r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed).*",
+                        str(
+                            _project_paths.project_path(
+                                _project_paths.V4_CHECKPOINTS_DIR
+                                / "pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params"
+                            )
+                        ),
+                    ),
+                ),
+                num_train_steps=1_000,
+                save_interval=250,
+                keep_period=250,
+                num_workers=12,
+                fsdp_devices=1,
+            ),
         )
     )(),
     #

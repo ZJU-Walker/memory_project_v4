@@ -341,7 +341,19 @@ finite throughout (3.2 -> 0.44). Predicted writes commit at the oracle's rate: c
 write-eligible count at every interval (~7 commits per sequence, 0 degenerate), i.e. the
 frozen Stage-1 head is confident on the evidence frames. Batteries launched 04:23 on the same
 job (`v4/diagnostics/run_batteries_2b_r1.sh`): `stage2_eval_2b_r1_{999,500}/` and
-`side_flip_2b_r1_{999,500}/` (both with `--config-name pi05_yam_mem_v4_stage2b`). Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+`side_flip_2b_r1_{999,500}/` (both with `--config-name pi05_yam_mem_v4_stage2b`).
+
+**Stage 2b verdict (2026-09-02 05:10): PASS -- predicted writes are as good as the oracle.**
+ckpt-999: read head 1.000 normal / 0.500 reset / 0.504 donor (faithful to the donor's fact);
+side-flip v2 first-step: normal 1.000 (+10.4 nats), reset 0.583, donor-implied-other-side
+flip 24/24, donor-implied-same-side correct 24/24, follows-content **1.000** (all 230
+steps: 0.922, normal 1.000 at +14.4 nats). Old CE gates: reset decision-CE ratio 1.248
+(passes), donor 1.077 and use-flow 1.053 (fail, same dilution as in 2a; informational).
+ckpt-500 was still converging (normal side accuracy 0.83, follows-content 0.77), so the
+1000-update budget at batch 2 is needed. 2a/2b gap at ckpt-999 = 0 on every use/read
+metric: the frozen Stage-1 head's writes carry no measurable perception error on the dev
+split (commit == eligible at ~7 per sequence throughout training). Reports:
+`stage2_eval_2b_r1_{999,500}/stage2_eval.json`, `side_flip_2b_r1_{999,500}/side_flip_eval.json`. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
