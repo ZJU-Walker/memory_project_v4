@@ -518,7 +518,11 @@ default XLA; every reported accuracy carries about +-0.05 of run-to-run spread, 
 content-following verdict (0.875–0.958 first step across four runs) survives it while the
 per-window answer does not. The `_det` run (deterministic ops, autotune off) and a second
 `_det2` run (queued behind the closed loop, `run_det2_4c_r1.sh`) decide whether the flags
-restore reproducibility.
+restore reproducibility. `_det` landed 13:52: first-step normal 0.854, reset 0.354, flip
+23/24, follows-content 0.917; versus the original it toggles the same fragile windows
+between the same two values ((2,1) +8.8 -> -11.0, (7,0) +9.7 -> -12.4, (7,3) -11.2 -> +9.0)
+-- expected, since the flags change the kernels; only `_det` vs `_det2` answers the
+reproducibility question.
 
 ckpt-500 semantic side-flip (13:13): first step normal 0.375 (+0.14 nats), reset 0.500,
 follows-content 0.500; all steps normal 0.643, reset 0.713, follows-content 0.487 -> at
