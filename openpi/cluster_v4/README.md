@@ -643,6 +643,59 @@ batteries; ckpt-999 semantic / visual / both -> `closed_loop_4c_r1_999_<bank>/`,
 status `closed_loop_4c_r1_status.log`). Pure-function tests: `v4_closed_loop_eval_test.py`.
 The raw-video replay script stays v3.x-only.
 
+**Closed-loop, visual-bank interventions, ckpt-999 (15:07):** on the inference path the
+decision is untouched by wiping or swapping the visual bank (free-decoded side 1.000 under
+normal / visual-reset / visual-donor, D margins +11.5 / +8.3 / +11.5) -- the visual bank is
+inert for the decision on the deployment path too, as on the sequence path.
+
+**Did the memory parameters train in Stage 4c? (checkpoint diff 250 -> 999,
+`v4/diagnostics/memory_param_drift_v4.py`, log `param_drift_4c_r1_250_999.log`).**
+Visual bank: 30/36 leaves moved (Titans core, k/q/v projections, both query compressors,
+write conditioner, visual slot embedding); unchanged = the frozen injection gate and the
+output layer's slow copy (the fast copy lives in the state). Semantic bank: read head, slot
+embedding and the bank's hidden layers moved; its k/q/v projections are unused by the
+explicit key/value writes (structural), `fact_keys` and `fact_value_embed` are frozen (the
+bank is a fixed-code slot store: the read head and Gemma learn the code), gate frozen. Fact
+head (compressor + logit head) FROZEN as intended in 4c (Stage-1 graft); v3.5 side heads
+FROZEN as intended (4c). So the v36-style failure (memory path never trained, probes passed
+through a random projection) is absent here -- and, independently, none of the v4 verdicts
+rest on parameter movement: they rest on read-side interventions of the decision.
+
+**Robot server + client for v4 (2026-09-02, commit after `171d406`).** The user asked for the
+deployment path ahead of the remaining confirmations. Changes:
+
+- `scripts/serve_yam_memory.py` (was v3/v3.1-only; a v4 model raised at the first request,
+  and a v3.5 model would have silently never written because the clock masks defaulted to
+  false): threads `semantic_state` next to the visual state and returns
+  `aux["v4_semantic_state"]` into the next request; passes `v35_transition_valid=True` on
+  every request (one request = one memory tick at `memory_stride_frames=15`, 0.5 s @ 30 Hz)
+  and `v35_write_mask` from `--write-policy`: `always` (default; the fact head's 0.9
+  confidence gate decides -- the schedule the closed-loop `--write-policy always` run
+  validates offline) or `client` (commit only when the request carries `memory_write: true`).
+  `reset_memory` resets both banks. Responses add `fact_predicted`, `fact_confidence`,
+  `sem_commit_now`, `sem_commits`, `read_predicted`, `sem_injected_rms`, `write_allowed`.
+  Metadata adds `memory_v35_enabled`, `memory_v4_dual_bank`, `memory_fact_slots/targets/
+  write_conf`, `fact_slot_names` / `fact_target_names` (from the fact-label sidecar:
+  banana, grey_pepper_box / left_bin, right_bin, unknown), `write_policy`. `--warmup`
+  (default on) runs a plain and an RTC-prefixed synthetic request before serving so the
+  JIT compile happens before the robot connects, then resets. The gate log line no longer
+  assumes a v3 `memory_gate`.
+- `src/openpi/serving/websocket_policy_server.py`: `infer` now runs via `asyncio.to_thread`,
+  so keepalive pings keep flowing during a long request. This was the unfixed bug that ended
+  the 2026-08-11 robot trial (cold compile inside the handler -> client ping timeout).
+  `openpi_client.WebsocketClientPolicy(ping_timeout=...)` added for the client side.
+- `examples/yam/client_memory_v4.py`: the v3.1 client hard-required `pi05_yam_mem_v31`.
+  The v4 client validates `memory_v4_dual_bank`, `write_policy == always`, stride 15 (v4
+  trained at 15; the RTC broker replans every 15 controls), RTC fields, and that the prompt
+  is a v4 training prompt (`find the banana` / `find the grey pepper box`; v3.1's "find the
+  bin with banana" is not). Overlay shows the subtask, what the fact head sees now (per
+  slot, confidence, `*` on a commit), what the bank holds (read-head decode) and the commit
+  count. Same hardware plumbing, ramp, double reset and recording as before. `--dry-run`
+  checks the contract without hardware.
+- Tests: `serve_yam_memory_test.py` (v4 metadata, write-policy resolution, legacy fields
+  null), `client_memory_v4_test.py` (metadata guard, readout). CPU smoke of the real path:
+  `v4/diagnostics/server_smoke_cpu.py` (create_policy + warmup + 3 requests on ckpt-999).
+
 Historical (2b-era) plan, kept for the record: battery plan for 2b = `v4_stage2_eval.py`
 + `v4_side_flip_eval.py` on ckpt 500/999; the 2a/2b gap = perception error of the
 predicted write path (watch `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the

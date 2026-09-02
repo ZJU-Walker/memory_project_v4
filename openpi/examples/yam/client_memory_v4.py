@@ -326,9 +326,16 @@ def _run_dry(ws_client, policy, args: Args, names: _Names) -> None:
 
 def main(args: Args) -> None:
     # --- Connect to the policy server ---
-    ws_client = _websocket_client_policy.WebsocketClientPolicy(
-        host=args.host, port=args.port, ping_timeout=args.ping_timeout
-    )
+    try:
+        ws_client = _websocket_client_policy.WebsocketClientPolicy(
+            host=args.host, port=args.port, ping_timeout=args.ping_timeout
+        )
+    except TypeError:
+        # Older openpi_client on the robot computer (no ping_timeout): still works when the
+        # server was started with --warmup (default), which keeps every request well under
+        # the library's 20 s keepalive timeout.
+        logging.warning("openpi_client without ping_timeout support; make sure the server was warmed up")
+        ws_client = _websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
     metadata = ws_client.get_server_metadata()
     logging.info("Server metadata: %s", metadata)
     validate_v4_metadata(metadata, args)
