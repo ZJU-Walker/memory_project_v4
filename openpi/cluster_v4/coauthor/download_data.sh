@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Download everything training needs from the public Hugging Face repos into the project layout.
+#   bash openpi/cluster_v4/coauthor/download_data.sh [--no-policy-checkpoint]
+# Pulls:
+#   dataset  kewalk123/bin_memory_0830_0831_v36_subtask @ bd97941e  -> data/lerobot/yam/bin_memory_0830_0831_v36_subtask/{data,meta}  (41.6 GB, 70 episodes)
+#   model    kewalk123/openpi-v4-memory-artifacts                    -> data/*.json, v4/assets/..., v4/checkpoints/... (Stage-1 head 5 GB; Stage-4c policy 10 GB unless --no-policy-checkpoint)
+# The Pi0.5 base weights (gs://openpi-assets/checkpoints/pi05_base) are fetched by the trainer itself.
+# Verifies the manifest / fact-label SHA256 pins the training config enforces. Re-running only fetches missing files.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+root="$(cd -- "${here}/../../.." && pwd -P)"
+cd "${root}/openpi"
+source "${root}/openpi/cluster_v35/env.sh"
+hf="${root}/openpi/.venv/bin/huggingface-cli"
+[ -x "${hf}" ] || { echo "run setup_env.sh first (${hf} missing)" >&2; exit 2; }
+
+DATASET_REPO=kewalk123/bin_memory_0830_0831_v36_subtask
+DATASET_REV=bd97941eca402f8be854ee8a0a3bbad14df37292
+ARTIFACTS_REPO=kewalk123/openpi-v4-memory-artifacts
+dataset_dir="${root}/data/lerobot/yam/bin_memory_0830_0831_v36_subtask"
+
+echo "[data] dataset -> ${dataset_dir}"
+mkdir -p "${dataset_dir}"
+"${hf}" download "${DATASET_REPO}" --repo-type dataset --revision "${DATASET_REV}" --local-dir "${dataset_dir}" >/dev/null
+rm -rf "${dataset_dir}/.cache"
+n_parquet=$(find "${dataset_dir}/data" -name '*.parquet' | wc -l)
+[ "${n_parquet}" = "70" ] || { echo "[data] expected 70 parquet files, found ${n_parquet}" >&2; exit 3; }
+[ -f "${dataset_dir}/meta/info.json" ] || { echo "[data] meta/info.json missing" >&2; exit 3; }
+
+echo "[data] artifacts -> ${root}"
+exclude=()
+if [ "${1:-}" = "--no-policy-checkpoint" ]; then exclude=(--exclude 'v4/checkpoints/pi05_yam_mem_v4_stage4c/*'); fi
+"${hf}" download "${ARTIFACTS_REPO}" --repo-type model --local-dir "${root}" "${exclude[@]}" >/dev/null
+rm -rf "${root}/.cache"
+
+echo "[data] verifying pinned digests"
+"${root}/openpi/.venv/bin/python" - "${root}" <<'EOF'
+import hashlib, pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+cfg = (root / "openpi/src/openpi/training/config.py").read_text()
+pins = {
+    "data/0830_0831_episode_manifest_v36_frozen.json": re.search(r'memory_episode_manifest_sha256=\("([0-9a-f]{64})"\)', cfg).group(1),
+    "data/v4_fact_labels_0830_0831.json": re.search(r'memory_v4_fact_labels_sha256=\("([0-9a-f]{64})"\)', cfg).group(1),
+}
+ok = True
+for rel, expected in pins.items():
+    digest = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+    print(f"  {rel}: {'OK' if digest == expected else 'MISMATCH ' + digest}")
+    ok &= digest == expected
+for rel in (
+    "v4/assets/pi05_yam_0830_0831_v36/yam/bin_memory_0830_0831_v36_subtask/norm_stats.json",
+    "v4/checkpoints/pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params",
+):
+    present = (root / rel).exists()
+    print(f"  {rel}: {'present' if present else 'MISSING'}")
+    ok &= present
+sys.exit(0 if ok else 4)
+EOF
+echo "[data] done. Next: bash openpi/cluster_v4/coauthor/train_8gpu.sh"
