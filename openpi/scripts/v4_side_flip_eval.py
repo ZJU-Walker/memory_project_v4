@@ -75,19 +75,37 @@ def summarize(records: list[dict], *, first_step_only: bool = False) -> dict:
         out[f"{cond}_side_accuracy"] = float(np.mean(d > 0))
         out[f"{cond}_mean_margin"] = float(np.mean(d))
         out[f"{cond}_mean_abs_margin"] = float(np.mean(np.abs(d)))
-    mismatched = [r for r in valid if r["donor_mismatched"]]
-    matched = [r for r in valid if not r["donor_mismatched"]]
+    # Content-consistent pairing: expected answer under the donor bank = donor's fact for the
+    # OWN prompted object. "Mismatched" = that expectation differs from the own side.
+    usable = [r for r in valid if r.get("donor_expected_valid", True)]
+    mismatched = [r for r in usable if r["donor_mismatched"]]
+    matched = [r for r in usable if not r["donor_mismatched"]]
+    out["donor_expected_valid"] = len(usable)
     out["donor_mismatched_pairs"] = len(mismatched)
     out["donor_matched_pairs"] = len(matched)
     if mismatched:
         d = np.asarray([r["D_donor"] for r in mismatched])
-        out["donor_flip_rate_mismatched"] = float(np.mean(d < 0))  # follows the DONOR's side
+        out["donor_flip_rate_mismatched"] = float(np.mean(d < 0))  # names the donor-implied side
         out["donor_mean_margin_mismatched"] = float(np.mean(d))
         d_normal = np.asarray([r["D_normal"] for r in mismatched])
         out["donor_margin_shift_mismatched"] = float(np.mean(d_normal - d))
     if matched:
         d = np.asarray([r["D_donor"] for r in matched])
-        out["donor_side_accuracy_matched"] = float(np.mean(d > 0))
+        out["donor_side_accuracy_matched"] = float(np.mean(d > 0))  # donor implies the SAME side
+    # Content-following rate over every usable donor step: names the donor-implied side.
+    if usable:
+        follows = [
+            (r["D_donor"] < 0) if r["donor_mismatched"] else (r["D_donor"] > 0) for r in usable
+        ]
+        out["donor_follows_content_rate"] = float(np.mean(follows))
+    # Legacy pairing by the donor's own TARGET side (what the first report used).
+    if any("donor_target_mismatched" in r for r in valid):
+        t_mis = [r for r in valid if r["donor_target_mismatched"]]
+        t_mat = [r for r in valid if not r["donor_target_mismatched"]]
+        if t_mis:
+            out["legacy_target_flip_rate_mismatched"] = float(np.mean(np.asarray([r["D_donor"] for r in t_mis]) < 0))
+        if t_mat:
+            out["legacy_target_side_accuracy_matched"] = float(np.mean(np.asarray([r["D_donor"] for r in t_mat]) > 0))
     return out
 
 
@@ -151,6 +169,20 @@ def main(argv=None) -> None:
         batch = sides.shape[0]
         # The model's donor intervention is jnp.roll(state, 1, axis=0): sequence b reads b-1.
         donor_sides = np.roll(sides, 1)
+        # The bank stores OBJECT facts (slot 0 banana, slot 1 grey_pepper_box; always on
+        # opposite sides in 0830/0831) while the decision names the TARGET side = side of the
+        # prompted object. Under a donor bank, the content-consistent answer is the DONOR's
+        # fact for the OWN prompted object -- not the donor's target side. The prompted slot
+        # is the slot whose own fact equals the own target side.
+        fact_labels = np.asarray(jax.device_get(observation.seq_fact_labels))  # [b, F]
+        donor_fact_labels = np.roll(fact_labels, 1, axis=0)
+        prompted_slot = np.full(batch, -1, dtype=np.int64)
+        expected_donor_side = np.full(batch, -1, dtype=np.int64)
+        for b in range(batch):
+            matches = np.flatnonzero(fact_labels[b, :2] == sides[b])
+            if matches.size == 1:
+                prompted_slot[b] = int(matches[0])
+                expected_donor_side[b] = int(donor_fact_labels[b, prompted_slot[b]])
         causal = np.asarray(observation.tokenized_causal)
         causal_mask = np.asarray(observation.tokenized_causal_mask)
         fast_mask = np.asarray(observation.causal_fast_mask)
@@ -175,6 +207,7 @@ def main(argv=None) -> None:
             steps = np.flatnonzero(active[b])
             for order, t in enumerate(steps):
                 included = bool(has_side[b, t] and token_count[b, t] > 0)
+                expected = int(expected_donor_side[b])
                 record = {
                     "batch": index,
                     "row": b,
@@ -182,7 +215,15 @@ def main(argv=None) -> None:
                     "decision_order": order,  # 0 = first decision step of the sequence
                     "side": int(sides[b]),
                     "donor_side": int(donor_sides[b]),
-                    "donor_mismatched": bool(sides[b] != donor_sides[b]),
+                    "fact_labels": fact_labels[b].tolist(),
+                    "donor_fact_labels": donor_fact_labels[b].tolist(),
+                    "prompted_slot": int(prompted_slot[b]),
+                    # Content-consistent expectation under the donor bank (own prompt, donor facts).
+                    "expected_donor_side": expected,
+                    "donor_expected_valid": bool(expected in (0, 1)),
+                    "donor_mismatched": bool(expected in (0, 1) and expected != int(sides[b])),
+                    # Legacy pairing by the donor's own TARGET side (kept for comparison).
+                    "donor_target_mismatched": bool(sides[b] != donor_sides[b]),
                     "decision_tokens": int(token_count[b, t]),
                     "has_side_token": bool(has_side[b, t]),
                     "included": included,
@@ -222,6 +263,17 @@ def main(argv=None) -> None:
             print(
                 f"  donor matched pairs={s['donor_matched_pairs']}: "
                 f"side_accuracy={s['donor_side_accuracy_matched']:.3f}"
+            )
+        if "donor_follows_content_rate" in s:
+            print(
+                f"  donor FOLLOWS-CONTENT rate (names the donor-implied side, all usable steps="
+                f"{s['donor_expected_valid']})={s['donor_follows_content_rate']:.3f}"
+            )
+        if "legacy_target_flip_rate_mismatched" in s:
+            print(
+                f"  [legacy target-side pairing] flip_rate_mismatched="
+                f"{s['legacy_target_flip_rate_mismatched']:.3f} "
+                f"side_accuracy_matched={s.get('legacy_target_side_accuracy_matched', float('nan')):.3f}"
             )
 
     show("all decision steps", summary)
