@@ -505,7 +505,8 @@ ckpt-500 semantic side-flip (13:13): first step normal 0.375 (+0.14 nats), reset
 follows-content 0.500; all steps normal 0.643, reset 0.713, follows-content 0.487 -> at
 step 500 Stage 4c does not use the semantic bank yet (2b's ckpt-500 was at 0.77): the live
 visual bank delays the onset of use, which then arrives between 500 and 999. The remaining
-ckpt-500 runs are confirmatory of "not yet" and are not tabulated.
+ckpt-500 runs (visual / both flips, gate batteries) were cancelled at 13:15 to hand the
+GPU to the determinism probe; `batteries_4c_r1.done` was touched by hand.
 
 Gate battery `--bank visual` ckpt-999 (12:58): decision CE 2.079 normal / 2.061 visual-reset
 / 2.079 visual-donor, semantic read accuracy 0.961 under all three -- the visual bank is
