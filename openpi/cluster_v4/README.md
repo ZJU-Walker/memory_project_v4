@@ -445,7 +445,16 @@ visual_reset and visual_donor should stay ~1.0 if the side lives in the semantic
 Stage-4 r1 policy would collapse). Stage 4c batteries queue automatically after step 999
 (`run_batteries_4c_r1.sh`): per checkpoint (999, then 500) side-flip semantic / visual /
 both and stage2_eval semantic / visual -> `side_flip_4c_r1_<step>_<bank>/`,
-`stage2_eval_4c_r1_<step>_<bank>/`. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+`stage2_eval_4c_r1_<step>_<bank>/`.
+
+**Stage 4c r1 finished 2026-09-02 11:57** (1000 updates, no preemption, ckpts 250/500/750/999).
+Numerically clean and, unlike Stage 4 r1, no late anomaly: semantic commits stayed at
+~7/sequence to the end (13.9/update at 800), read loss 0.407 at 800 (2b: 0.398), CE 2.71,
+flow 0.0115. Batteries started 11:58 on the H100 job. H200 note: the 1-GPU job 17207774 on
+iris-hgx-2 was checked as a second eval GPU and rejected for now -- that node reads /iris at
+~11 MB/s (468 MiB CUDA library in 45 s, load average 158), so a JAX import takes minutes and
+the matmul smoke test timed out twice; it has a 17 TB local /scr, so any future use there
+must stage the venv, checkpoints and dataset locally first. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
