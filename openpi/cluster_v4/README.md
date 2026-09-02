@@ -501,6 +501,25 @@ commit gate / hysteresis, or FP32 for the head + commit decision), not in the da
 then the honest ckpt-999 first-step normal accuracy is "0.85–0.94 depending on the run" and
 6/48 windows are coin flips between runs.
 
+Plain rerun result (13:29, `side_flip_4c_r1_999_semantic_rerun/`, identical command, same
+GPU, same 48 windows; comparison tool `v4/diagnostics/compare_side_flip_runs.py`): first-step
+normal accuracy 0.938 -> 0.896; normal D sign flips on 26/230 steps; |dD| bins
+[0,.05,.5,2,5,10,inf] = [128, 23, 36, 26, 3, 14] -- 128 steps reproduce to <0.05 nats, the
+rest drift, 14 by >10 nats. The SAME windows flip between the SAME two values as in the
+other runs ((2,1): +8.8 <-> -11.2, (7,0): +9.7 <-> -12.4, (9,3): -11.2 <-> +8.8, and the
+near-zero pair (0,0)/(0,2)/(11,3): +1.5 <-> -0.8), i.e. each fragile window has two
+attractor outcomes, not continuous noise -- consistent with one discrete commit differing
+(which E step's content lands in the bank). The RESET condition (blank semantic bank read)
+also drifts, by 0.5–5 nats on ~100 steps: the run-to-run difference is not only the
+semantic commit -- the VISUAL bank's recurrent state (Titans inner updates with grad-norm
+clipping and commit gates) diverges between runs as well. Conclusion so far: the
+sequence-path evaluation of this model is not run-reproducible on the H100 at bf16 with
+default XLA; every reported accuracy carries about +-0.05 of run-to-run spread, and the
+content-following verdict (0.875–0.958 first step across four runs) survives it while the
+per-window answer does not. The `_det` run (deterministic ops, autotune off) and a second
+`_det2` run (queued behind the closed loop, `run_det2_4c_r1.sh`) decide whether the flags
+restore reproducibility.
+
 ckpt-500 semantic side-flip (13:13): first step normal 0.375 (+0.14 nats), reset 0.500,
 follows-content 0.500; all steps normal 0.643, reset 0.713, follows-content 0.487 -> at
 step 500 Stage 4c does not use the semantic bank yet (2b's ckpt-500 was at 0.77): the live
