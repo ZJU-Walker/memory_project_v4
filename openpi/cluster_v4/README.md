@@ -501,6 +501,13 @@ commit gate / hysteresis, or FP32 for the head + commit decision), not in the da
 then the honest ckpt-999 first-step normal accuracy is "0.85–0.94 depending on the run" and
 6/48 windows are coin flips between runs.
 
+Gate battery `--bank visual` ckpt-999 (12:58): decision CE 2.079 normal / 2.061 visual-reset
+/ 2.079 visual-donor, semantic read accuracy 0.961 under all three -- the visual bank is
+inert for the decision and for the semantic read, as the side-flip said. Direct evidence
+for the commit-flip explanation of the run-to-run swings: on the SAME 48 windows this run
+committed 340 semantic slots and the semantic-bank run 342, and normal read accuracy came
+out 0.961 vs 0.987 -- two commits differed between two runs of one checkpoint.
+
 Gate battery (`v4_stage2_eval.py --bank semantic`) ckpt-999, 12:35: read side perfect and
 causal (read acc 0.987 normal / 0.500 reset / 0.498 donor), `sem_commits` 342 over 48
 windows = 7.1 per window (Stage 4 r1 had 1023 -- the commit anomaly is gone), decision CE
