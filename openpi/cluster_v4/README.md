@@ -396,7 +396,43 @@ from the battery numbers and documented here: (a) unfreeze the fact head with it
 (`memory_fact_loss_weight=0.5`, the `unknown` abstention supervision) so it co-adapts with
 h8 -- the base `pi05_yam_mem_v4` intent, requires re-running the Stage-1 purity battery on the
 result; (b) stop the visual side-loss gradient at the h8 boundary (feature stop-gradient) so
-the visual bank adapts only through its own compressors; (c) freeze blocks 0-8 in Stage 4. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+the visual bank adapts only through its own compressors; (c) freeze blocks 0-8 in Stage 4.
+
+**Stage 4 r1 batteries (2026-09-02 08:02-09:08, `stage2_eval_4_r1_{999,750,500}/`,
+`side_flip_4_r1_{999,750,500}/`):**
+
+| Stage 4 r1 | ckpt-500 | ckpt-750 | ckpt-999 |
+|---|---|---|---|
+| read head, own memory (normal / reset / donor) | 1.000 / 0.500 / 0.504 | 0.926 / 0.500 / 0.517 | 0.830 / 0.500 / 0.524 |
+| semantic commits over the 48 dev windows | 345 (~7/seq) | 726 | 1023 (~21/seq) |
+| decision names true side, first step (all steps) | 0.56 (0.67) | 0.33 (0.62) | **0.98 (0.98)** |
+| decision with the SEMANTIC bank wiped, first step | 0.46 | 0.42 | **0.77** |
+| donor implies other side: flip rate, first step | 0.58 | 0.71 | **0.04** |
+| follows semantic content, first step (all) | 0.54 (0.52) | 0.56 (0.58) | **0.52 (0.52)** |
+| old CE gates: reset decision-CE ratio | 1.19 | 1.05 | 1.02 |
+
+Reading: by ckpt-999 the policy names the side almost perfectly, yet wiping or swapping the
+semantic bank barely moves it (Stage 2b: 24/24 flips; here 1/24). With both banks live the
+side is carried by the VISUAL bank (16 side-supervised tokens) and the semantic bank became
+redundant; the same side supervision reshaped layer 8 under the frozen head (commit
+anomaly, read accuracy 1.00 -> 0.83). Root cause is a Stage-4 recipe choice, not the
+architecture: the v3.5 write/read side losses at 0.3/0.3 train the visual bank to encode
+the side explicitly. In v4 the fact belongs to the semantic bank; the visual bank must not be
+side-supervised (2a/2b kept those losses inert at 1e-6). Option (a) "co-adapting fact head"
+(`pi05_yam_mem_v4_stage4b`, commit `32b7385`) is kept as a fallback; it treats the symptom.
+
+**Stage 4c launched 2026-09-02 09:12 PDT** = the corrected Stage 4: config
+`pi05_yam_mem_v4_stage4c` (commit `45f8595`) differs from Stage 4 only in
+`memory_write_side_loss_weight=memory_read_side_loss_weight=1e-6` and the side heads
+frozen; vs Stage 2b it differs only in `memory_v4_visual_injection=True`,
+`memory_injection_c=12.4` and the visual subsystem (core, compressors, conditioner)
+unfrozen. Exp `v4_stage4c_20260902_r1`, job 17192955, `BATCH=2 ACCUM=1 run_train_1gpu.sh
+pi05_yam_mem_v4_stage4c v4_stage4c_20260902_r1`, fresh from pi05_base + Stage-1 head,
+auto-resume, ~2.7 h. Pass criteria for the corrected Stage 4 (both on ckpt-999):
+semantic follows-content at the first decision step >= 0.9 with commits ~7/sequence and
+read accuracy >= 0.9 (the 2b bar), AND -- once the visual-bank intervention exists -- the
+decision must survive a visual reset/donor swap (the side must come from the semantic bank,
+not the visual one). Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
