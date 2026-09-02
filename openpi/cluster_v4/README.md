@@ -432,7 +432,20 @@ auto-resume, ~2.7 h. Pass criteria for the corrected Stage 4 (both on ckpt-999):
 semantic follows-content at the first decision step >= 0.9 with commits ~7/sequence and
 read accuracy >= 0.9 (the 2b bar), AND -- once the visual-bank intervention exists -- the
 decision must survive a visual reset/donor swap (the side must come from the semantic bank,
-not the visual one). Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+not the visual one).
+
+**Visual-bank intervention implemented (commit `5ceba42`).** `v4_intervention` accepts
+`reset`/`donor` (semantic, unchanged), `visual_reset`/`visual_donor` and `both_reset`/
+`both_donor`; all act on the decision-step READ only (carried states and writes untouched;
+unit test `test_v4_visual_and_both_interventions_are_read_side_only`). Both batteries take
+`--bank {semantic,visual,both}` and record it. Reading the visual runs: the donor pairing
+still uses the semantic expectation, so for `--bank visual` the numbers answer "does the
+decision SURVIVE losing / swapping the visual bank?" (normal-side accuracy under
+visual_reset and visual_donor should stay ~1.0 if the side lives in the semantic bank; the
+Stage-4 r1 policy would collapse). Stage 4c batteries queue automatically after step 999
+(`run_batteries_4c_r1.sh`): per checkpoint (999, then 500) side-flip semantic / visual /
+both and stage2_eval semantic / visual -> `side_flip_4c_r1_<step>_<bank>/`,
+`stage2_eval_4c_r1_<step>_<bank>/`. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
