@@ -224,6 +224,34 @@ exactly 0 (never attended). CE moves 4.112 -> 4.132 (the zero-K/V softmax sink i
 `v4/diagnostics/stage2a_20260901_r3.log`; health signal = `memory_grad_norm` finite and
 `v4_fact_read_loss` falling below ln(3) by step ~200. Battery on GPU 3 after the run.
 
+**r3 result (2026-09-01 21:42, 1000 updates, checkpoints 250/500/750/999):** the memory path
+trained -- `memory_grad_norm` finite at every interval (3.1 -> 0.48), `v4_fact_read_loss`
+1.075 -> 0.327, CE 15.8 -> 2.05, flow 0.148 -> 0.0096.
+**Stage-2 battery, ckpt-999 (`v4/diagnostics/stage2_eval_2a_r3_999/stage2_eval.json`, dev
+split, 12x4 sequences): PASS=False, 3/5 gates.** Read side is perfect and causal: read
+accuracy 1.000 normal, 0.500 under reset, 0.504 under donor swap (donor mismatched-pair
+fraction 0.54 -> the head reports the DONOR's fact). Use side is weak: decision-step subtask
+CE 2.155 normal / 2.465 reset (ratio 1.144 < 1.2) / 2.310 donor (ratio 1.072 < 1.2);
+use-pressure flow 0.0105 / 0.0116 reset (ratio 1.103, passes 1.1). So the backbone reads
+"a memory is present" more than "which fact": wrong content hurts less than no content.
+Note raw decision-step retrieval RMS 0.0116 < tau 0.02, i.e. the non-amplifying floor binds
+and the semantic tokens enter at ~0.5*12.4*0.58 = 3.6 RMS (~29% of residual scale), not
+the nominal 6.2. Losses were still falling at step 999; the 2a use gates are provisional.
+**ckpt-500 battery (`stage2_eval_2a_r3_500/`): PASS=False, 4/5** -- read 1.000 / reset
+0.500 / donor 0.504 (same as 999); decision CE 2.166 normal / **2.916 reset (ratio 1.346,
+passes)** / 2.370 donor (ratio 1.094, fails); use-flow ratio 1.115 (passes).
+**Trend 500 -> 999: memory USE erodes with more training** while the normal decision CE
+stays flat (2.166 -> 2.155): reset ratio 1.346 -> 1.144, donor ratio 1.094 -> 1.072. The
+backbone found a route to the same CE that does not need the memory (phase/visual cues in
+the dev decision steps, cf. the v3.4 leak history), and it never learned content
+dependence (wrong memory costs 7-9%, no memory costs 14-35%). Consequences: (1) do NOT
+simply resume r3 for more updates -- that goes the wrong way; (2) ckpt-500 is the best 2a
+checkpoint so far; (3) the missing piece is CONTENT use, which needs explicit pressure:
+e.g. weight decision-step CE, or train with the donor-swap as an auxiliary negative (the
+subtask target under a swapped bank must follow the bank), or re-check the dev decision
+steps for side leakage (the 0.92-AUC wrist-camera leak was trimmed in v3.4, not proven
+absent on 0830/0831). Decide before Stage 2b.
+
 Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
 `memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception
 error; then dual-bank inference (`sample_with_memory`) for sampled-action interventions, then
