@@ -179,7 +179,7 @@ def main(argv=None) -> None:
                 ce[(cond, tag, "count")] = count
         for b in range(batch):
             count = float(ce[("normal", "true", "count")][b])
-            included = bool(has_side[b]) and count == 1.0 and token_count[b] > 0
+            included = bool(has_side[b] and count == 1.0 and token_count[b] > 0)
             record = {
                 "batch": index,
                 "row": b,
@@ -200,20 +200,7 @@ def main(argv=None) -> None:
         print(f"batch {index + 1}/{args.batches} done", flush=True)
 
     summary = summarize(records)
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "config_name": args.config_name,
-        "split": args.split,
-        "batches": args.batches,
-        "batch_size": args.batch_size,
-        "parameter_tree_sha256": parameter_tree_sha256,
-        "summary": summary,
-        "records": records,
-    }
-    body = json.dumps(report, indent=2, sort_keys=True) + "\n"
-    report["report_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    print(f"wrote {report_path}")
+    # Print the headline BEFORE writing the report so the numbers survive any write failure.
     print(
         f"sequences={summary['sequences']} included={summary['included']} "
         f"excluded_no_side_token={summary['excluded_no_side_token']}"
@@ -237,6 +224,27 @@ def main(argv=None) -> None:
             f"  donor matched pairs={summary['donor_matched_pairs']}: "
             f"side_accuracy={summary['donor_side_accuracy_matched']:.3f}"
         )
+
+    def json_default(value):
+        # numpy scalars that slip through (np.bool_, np.integer, np.floating)
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "config_name": args.config_name,
+        "split": args.split,
+        "batches": args.batches,
+        "batch_size": args.batch_size,
+        "parameter_tree_sha256": parameter_tree_sha256,
+        "summary": summary,
+        "records": records,
+    }
+    body = json.dumps(report, indent=2, sort_keys=True, default=json_default) + "\n"
+    report["report_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=json_default) + "\n")
+    print(f"wrote {report_path}")
 
 
 if __name__ == "__main__":
