@@ -769,8 +769,10 @@ Two implementations, commit `11d2630`:
   closed-loop battery `--write-policy always` and the side-flip battery
   `--state-mask-prob 0`.
 
-**Sharing the project (2026-09-02).** Code goes to GitHub (`git@github.com:ZJU-Walker/
-memory_project_v4.git`, local branch `v4` published as `main`; the branch history was rewritten before publication to
+**Sharing the project (2026-09-02).** Code is on GitHub (`git@github.com:ZJU-Walker/
+memory_project_v4.git`, local branch `v4` published as `main`, first push 16:28 into the
+empty repository; `main` is the only remote ref, the local backup tag `pre-publish-v4` and
+the old `main` history stay local; the branch history was rewritten before publication to
 strip tool trailers and unify the author identity, so the short commit hashes cited above
 in this section refer to the pre-publication history -- find a commit by its subject line); data and artifacts are PUBLIC on Hugging Face: the
 LeRobot dataset `kewalk123/bin_memory_0830_0831_v36_subtask` (revision `bd97941e`, 41.6 GB,
