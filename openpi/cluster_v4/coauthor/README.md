@@ -5,8 +5,8 @@ batch) and needs no scheduler. Total download ~47 GB (dataset 41.6 GB, Stage-1 h
 the Pi0.5 base weights are fetched by the trainer from `gs://openpi-assets`).
 
 ```bash
-git clone git@github.com:ZJU-Walker/memory_project.git
-cd memory_project && git checkout v4
+git clone git@github.com:ZJU-Walker/memory_project_v4.git
+cd memory_project_v4
 WANDB=0 bash openpi/cluster_v4/coauthor/run_all.sh          # env -> data -> training
 ```
 

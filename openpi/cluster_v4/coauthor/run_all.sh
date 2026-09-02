@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fresh machine -> trained v4 policy in one command (no SLURM):
-#   git clone git@github.com:ZJU-Walker/memory_project.git && cd memory_project && git checkout v4
+#   git clone git@github.com:ZJU-Walker/memory_project_v4.git && cd memory_project_v4
 #   [WANDB=1] [GPUS=8] [BATCH=16] bash openpi/cluster_v4/coauthor/run_all.sh
 # Steps: environment (uv, pinned lock) -> data + artifacts from Hugging Face -> 8-GPU training.
 # Each step is idempotent; re-run after a failure and it continues where it stopped.

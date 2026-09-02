@@ -770,7 +770,7 @@ Two implementations, commit `11d2630`:
   `--state-mask-prob 0`.
 
 **Sharing the project (2026-09-02).** Code goes to GitHub (`git@github.com:ZJU-Walker/
-memory_project.git`, branch `v4`; the branch history was rewritten before publication to
+memory_project_v4.git`, local branch `v4` published as `main`; the branch history was rewritten before publication to
 strip tool trailers and unify the author identity, so the short commit hashes cited above
 in this section refer to the pre-publication history -- find a commit by its subject line); data and artifacts are PUBLIC on Hugging Face: the
 LeRobot dataset `kewalk123/bin_memory_0830_0831_v36_subtask` (revision `bd97941e`, 41.6 GB,
