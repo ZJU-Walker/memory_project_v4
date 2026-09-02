@@ -769,6 +769,18 @@ Two implementations, commit `11d2630`:
   closed-loop battery `--write-policy always` and the side-flip battery
   `--state-mask-prob 0`.
 
+**Sharing the project (2026-09-02).** Code goes to GitHub (`git@github.com:ZJU-Walker/
+memory_project.git`, branch `v4`); data and artifacts are PUBLIC on Hugging Face: the
+LeRobot dataset `kewalk123/bin_memory_0830_0831_v36_subtask` (revision `bd97941e`, 41.6 GB,
+made public today) and `kewalk123/openpi-v4-memory-artifacts` (manifest, fact labels, norm
+stats, the Stage-1 head checkpoint and the Stage-4c ckpt-999 policy, project-relative
+paths, SHA256s in its model card). `openpi/cluster_v4/coauthor/` holds the reproduction
+kit: `setup_env.sh` (uv, pinned lock), `download_data.sh` (both HF repos into the project
+layout + digest checks), `train_8gpu.sh` (one-process FSDP on 8 GPUs, batch 16, no SLURM,
+auto-resume), `run_all.sh` (all three), `README.md`, and `upload_artifacts_to_hf.py`.
+The cluster-specific `cluster_v4/env.sh` (pins HOME) is not used by the kit; it sources
+the path-relative `cluster_v35/env.sh`.
+
 Robot-trial runbook (v4):
 
 1. GPU box (inside the SLURM job that owns the H100; the evaluation queue must be killed
