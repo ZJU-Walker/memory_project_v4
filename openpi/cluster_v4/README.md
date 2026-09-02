@@ -376,7 +376,27 @@ clip at 5.0 and the state-cotangent clip are the guards), `v35_write_side_loss` 
 (visual injection live, not zero), and the semantic metrics as in 2b. Batteries after 999:
 `v4_stage2_eval.py` + `v4_side_flip_eval.py` with `--config-name pi05_yam_mem_v4_stage4`
 (the semantic reset/donor interventions still apply; a visual-bank intervention is not
-implemented yet and is the next battery item), then dual-bank `sample_with_memory`. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+implemented yet and is the next battery item), then dual-bank `sample_with_memory`.
+
+**Stage 4 r1 finished 2026-09-02 08:00** (1000 updates, no preemption, ckpts 250/500/750/999).
+Numerically clean (memory-group grad 52.7 at step 0 -> 0.76 at 900, one clipped 5308 spike at
+100; no NaN/inf), and identical to 2b through step 700 (CE 2.73, flow 0.0116, read loss
+0.484, semantic commits ~13/update, visual commits ~7/update). **Late anomaly:** the v3.5
+visual writer/reader side losses stayed at chance (0.69) until ~700 and then started
+learning (write 0.415 / read 0.484 at 900); in the same interval the SEMANTIC commit count
+jumped 13.0 -> 26.2 (800) -> 42.9 (900) per update (~21 per sequence vs the 7 real
+object-facts) and the semantic read loss rose 0.484 -> 0.692. Hypothesis: the frozen
+Stage-1 fact head reads the same layer-8 features that the now-trainable visual write path
+(side losses -> query compressors -> blocks 0-8) reshapes; once those gradients bite, the
+head's 0.9 confidence gate starts admitting spurious real-class writes on slots that must
+stay `unknown`, polluting the bank. Batteries launched 08:03 (`run_batteries_4_r1.sh`,
+`--config-name pi05_yam_mem_v4_stage4`): stage2_eval on 999 then 750, side-flip on 999 then
+750, then 500 -- ckpt-750 is the last pre-anomaly checkpoint. r2 candidates, to be chosen
+from the battery numbers and documented here: (a) unfreeze the fact head with its fact loss
+(`memory_fact_loss_weight=0.5`, the `unknown` abstention supervision) so it co-adapts with
+h8 -- the base `pi05_yam_mem_v4` intent, requires re-running the Stage-1 purity battery on the
+result; (b) stop the visual side-loss gradient at the h8 boundary (feature stop-gradient) so
+the visual bank adapts only through its own compressors; (c) freeze blocks 0-8 in Stage 4. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
