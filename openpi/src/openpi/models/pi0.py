@@ -3533,6 +3533,8 @@ class Pi0(_model.BaseModel):
         semantic_state: _memory.MemoryState | None = None,
         v4_oracle_targets: at.Int[at.Array, "b f"] | None = None,
         v4_oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
+        v4_read_semantic_state: _memory.MemoryState | None = None,
+        v4_read_visual_state: _memory.MemoryState | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens.
 
@@ -3566,17 +3568,21 @@ class Pi0(_model.BaseModel):
         top_tokens = num_img // len(preprocessed.images)
         mem_len = self._memory_token_total
         gen_base = prefix_len + mem_len
+        # Read-side overrides (v4 diagnostics): the reads below use them, the transitions in
+        # `finish` always act on the carried memory_state / semantic_state.
+        read_visual_state = memory_state if v4_read_visual_state is None else v4_read_visual_state
+        read_semantic_state = semantic_state if v4_read_semantic_state is None else v4_read_semantic_state
         prepared = self._v32_prepare_memory_prefix(
             prefix_tokens,
             prefix_mask,
             prefix_ar,
-            memory_state,
+            read_visual_state,
             top_token_count=top_tokens,
             zero_read=zero_read,
             state_token_mask=preprocessed.token_state_mask,
             v35_oracle_direction=v35_oracle_direction,
             v35_oracle_injected_rms=v35_oracle_injected_rms,
-            semantic_state=semantic_state,
+            semantic_state=read_semantic_state,
         )
         v4_on = getattr(self, "memory_v4_dual_bank", False)
         kv_cache = prepared["cache"]
@@ -3591,7 +3597,7 @@ class Pi0(_model.BaseModel):
             if not getattr(self, "memory_v35_enabled", False):
                 raise ValueError("v3.5 anchor geometry is available only for memory_v35_enabled models.")
             geometry_aux = self._v35_read_geometry(
-                memory_state,
+                read_visual_state,
                 prepared["read_queries"],
                 retrieved,
                 v35_anchor_key,
@@ -3850,8 +3856,15 @@ class Pi0(_model.BaseModel):
         semantic_state: _memory.MemoryState | None = None,
         v4_oracle_targets: at.Int[at.Array, "b f"] | None = None,
         v4_oracle_slot_mask: at.Bool[at.Array, "b f"] | None = None,
+        v4_read_semantic_state: _memory.MemoryState | None = None,
+        v4_read_visual_state: _memory.MemoryState | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
+
+        ``v4_read_semantic_state`` / ``v4_read_visual_state`` (v4 diagnostics only) replace
+        the bank the model READS this step while the carried ``semantic_state`` /
+        ``memory_state`` still receive the transition -- the closed-loop counterpart of the
+        sequence path's read-side-only reset/donor interventions.
 
         v4 dual-bank models additionally REQUIRE ``semantic_state`` (the semantic bank; start
         from ``memory_semantic.init_state(batch)``). The returned ``memory_state`` is the
@@ -3910,6 +3923,8 @@ class Pi0(_model.BaseModel):
             raise ValueError("semantic_state / v4_oracle_* were provided but this model has no semantic bank.")
         if (v4_oracle_targets is None) != (v4_oracle_slot_mask is None):
             raise ValueError("v4_oracle_targets and v4_oracle_slot_mask must be provided together.")
+        if not v4_on and (v4_read_semantic_state is not None or v4_read_visual_state is not None):
+            raise ValueError("v4_read_*_state overrides are v4 dual-bank diagnostics only.")
         if v4_on and getattr(self, "memory_fact_oracle_writes", False) and v4_oracle_targets is None:
             raise ValueError(
                 "this model was trained with oracle semantic writes (Stage 2a); pass v4_oracle_targets and "
@@ -3946,6 +3961,8 @@ class Pi0(_model.BaseModel):
                 semantic_state=semantic_state,
                 v4_oracle_targets=v4_oracle_targets,
                 v4_oracle_slot_mask=v4_oracle_slot_mask,
+                v4_read_semantic_state=v4_read_semantic_state,
+                v4_read_visual_state=v4_read_visual_state,
             )
         if any(
             value is not None

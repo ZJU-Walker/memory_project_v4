@@ -610,3 +610,20 @@ def test_v4_sample_with_memory_threads_the_semantic_bank(tiny_v4_seq):
             tiny_v4_seq.sample_with_memory(jax.random.key(1), observation, visual, semantic_state=semantic, **kwargs)
     finally:
         tiny_v4_seq.memory_fact_oracle_writes = False
+
+    # Read-side override (closed-loop reset/donor): the model READS the override bank (a
+    # fresh one retrieves exactly zero) while the carried bank still takes the transition.
+    _, _, override_aux = tiny_v4_seq.sample_with_memory(
+        jax.random.key(1),
+        observation,
+        visual,
+        semantic_state=committed,
+        v4_read_semantic_state=semantic,
+        v35_transition_valid=True,
+        v35_write_mask=False,
+        **kwargs,
+    )
+    np.testing.assert_array_equal(np.asarray(override_aux["v4_sem_retrieved"]), 0.0)
+    np.testing.assert_array_equal(np.asarray(override_aux["v4_sem_transition_applied"]), [True])
+    decayed, _ = tiny_v4_seq.v4_semantic_write(committed, commit_aux["v4_fact_logits"], jnp.asarray([False]))
+    jax.tree.map(np.testing.assert_array_equal, override_aux["v4_semantic_state"], decayed)
