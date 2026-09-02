@@ -321,8 +321,19 @@ prediction), fresh from pi05_base + Stage-1 head, code at `5c19e4c`. Exact comma
 `cluster_v4/train.sh pi05_yam_mem_v4_stage2b --exp-name v4_stage2b_20260902_r1 --batch-size 4
 --gradient-accumulation-steps 2 --fsdp-devices 1 --no-wandb-enabled` (global batch 4 as 2x2
 accumulation; the launcher adds `--resume` automatically after a preemption). Logs:
-`v4/diagnostics/train_v4_stage2b_20260902_r1{.log,_status.log}`. Expected ~20 s/update,
-1000 updates ~5.5 h. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+`v4/diagnostics/train_v4_stage2b_20260902_r1{.log,_status.log}`.
+**Attempt 1 (01:28) died at the first update: RESOURCE_EXHAUSTED on a 52.7 GB allocation** --
+XLA could not rematerialize the 2x2-accumulation program below 78.0 GiB on the 80 GB card
+(the accumulation loop keeps the accumulated gradient tree plus one microbatch's live
+activations; plain batch 2 needs ~67 GiB). **Attempt 2 (01:36, running): global batch 2,
+no accumulation** -- Stage 2a r2's proven single-H100 recipe -- via
+`BATCH=2 ACCUM=1 v4/diagnostics/run_train_1gpu.sh pi05_yam_mem_v4_stage2b v4_stage2b_20260902_r1`
+(= `--batch-size 2 --gradient-accumulation-steps 1 --fsdp-devices 1 --overwrite`; the launcher
+now defaults to this recipe and passes --overwrite when the directory exists without a
+checkpoint, --resume when it holds one). Documented deviation from r3: half the samples per
+update (global batch 2 vs 4) at the same 1000 updates and schedule, so 2b sees half of r3's
+data; ~9.5 s/update, ~2.7 h. If the 2a/2b comparison needs matched data volume, r3 ckpt-500
+(the same 2000 samples) is the fairer 2a reference point than ckpt-999. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
