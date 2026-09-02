@@ -289,6 +289,43 @@ save). Rule:
 Either way the run is launched by the same script and documented here with its exp name,
 commit, and the exact command.
 
+**Side-flip v2 result (2026-09-02 01:26, H100 job 17192955, commit `5c19e4c`,
+`v4/diagnostics/side_flip_2a_r3_{500,999}_v2/side_flip_eval.json`).** The v1 donor pairing
+was wrong for this task: the bank stores OBJECT facts (slot 0 banana, slot 1 grey pepper
+box; always on opposite sides in 0830/0831), while the decision names the TARGET side of the
+PROMPTED object. Under a donor bank the content-consistent answer is therefore the donor's
+fact for the OWN prompted object, which is often the opposite of the donor's target side;
+v1's "matched" pairs were mostly content-mismatched, which is why they scored at chance.
+With the corrected pairing (all 230 decision steps / first decision step per window):
+* normal: names the true side 1.000 / 1.000 (margins +13 nats, both checkpoints);
+* reset: 0.60 / 0.44 (ckpt-500), 0.57 / 0.27 (ckpt-999) -- without memory the side is unknown;
+* donor implies the other side: flips to it 0.85 / **1.00** (500), 0.84 / **1.00** (999);
+* donor implies the same side: stays correct 1.00 / 1.00;
+* follows-content rate 0.93 / **1.00** (500), 0.92 / **1.00** (999).
+**Verdict: Stage 2a PASSES its purpose.** With oracle writes, the policy's decision at the
+static waiting frame is a function of the memory content combined with the prompt, at
+near-certainty, and collapses without the memory. The CE-ratio gates (`stage2_eval.json`)
+and the v1 pairing under-measured use: the CE ratios average every causal token of every
+decision step (FAST action tokens included) and the v1 pairing scored correct
+memory-following as errors. The 500 -> 999 "erosion" seen in the CE ratios does not appear
+in the content-following rate (0.93 -> 0.92, first-step 1.00 -> 1.00). Gate proposal for
+the later stages: replace `reset_decision_ce_ratio` / `donor_decision_ce_ratio` with
+`first-step follows-content >= 0.9` and `first-step reset side accuracy <= 0.6`.
+
+**Stage 2b launched 2026-09-02 01:28 PDT** (rule branch 1): job 17192955 (1 H100,
+`iris` partition, preemptible), exp `v4_stage2b_20260902_r1`, config
+`pi05_yam_mem_v4_stage2b` (commit `c849c3c`: differs from 2a only in
+`memory_fact_oracle_writes=False`; the frozen Stage-1 fact head writes its confidence-gated
+prediction), fresh from pi05_base + Stage-1 head, code at `5c19e4c`. Exact command:
+`v4/diagnostics/run_train_1gpu.sh pi05_yam_mem_v4_stage2b v4_stage2b_20260902_r1` =
+`cluster_v4/train.sh pi05_yam_mem_v4_stage2b --exp-name v4_stage2b_20260902_r1 --batch-size 4
+--gradient-accumulation-steps 2 --fsdp-devices 1 --no-wandb-enabled` (global batch 4 as 2x2
+accumulation; the launcher adds `--resume` automatically after a preemption). Logs:
+`v4/diagnostics/train_v4_stage2b_20260902_r1{.log,_status.log}`. Expected ~20 s/update,
+1000 updates ~5.5 h. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
+`v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
+
 Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
 `memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception
 error; then dual-bank inference (`sample_with_memory`) for sampled-action interventions, then
