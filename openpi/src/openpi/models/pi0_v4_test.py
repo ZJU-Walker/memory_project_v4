@@ -12,6 +12,7 @@ from openpi.models import gemma
 from openpi.models import memory
 from openpi.models import pi0
 from openpi.models import pi0_config
+from openpi.models.pi0_v32_test import _single_observation
 from openpi.models.pi0_v35_test import _TinyV35
 from openpi.models.pi0_v35_test import _v35_sequence_observation
 
@@ -54,7 +55,9 @@ def _v35_kwargs(**overrides) -> dict:
 def test_v4_config_requires_delta_semantic_bank_and_v35_semantics():
     # Valid v4 config: dual bank on top of a legal v3.5 config.
     config = pi0_config.Pi0Config(
-        **_v35_kwargs(memory_v4_dual_bank=True, memory_semantic=_delta_memory_config())
+        **_v35_kwargs(
+            memory_v4_dual_bank=True, memory_mask_zero_tokens=True, memory_semantic=_delta_memory_config()
+        )
     )
     observation_spec, _ = config.inputs_spec(batch_size=2)
     assert observation_spec.seq_fact_labels.shape == (2, config.memory_fact_slots)
@@ -66,12 +69,20 @@ def test_v4_config_requires_delta_semantic_bank_and_v35_semantics():
     assert off_spec.seq_fact_labels is None
     assert off_spec.seq_fact_observable is None
 
+    # A blank bank injects exactly-zero tokens: v4 must mask them (Stage 2a r2 regression).
+    with pytest.raises(ValueError, match="memory_mask_zero_tokens"):
+        pi0_config.Pi0Config(**_v35_kwargs(memory_v4_dual_bank=True, memory_semantic=_delta_memory_config()))
     with pytest.raises(ValueError, match="pooled-frame delta_output"):
-        pi0_config.Pi0Config(**_v35_kwargs(memory_v4_dual_bank=True, memory_semantic=memory.MemoryConfig()))
+        pi0_config.Pi0Config(
+            **_v35_kwargs(
+                memory_v4_dual_bank=True, memory_mask_zero_tokens=True, memory_semantic=memory.MemoryConfig()
+            )
+        )
     with pytest.raises(ValueError, match="alpha_step"):
         pi0_config.Pi0Config(
             **_v35_kwargs(
                 memory_v4_dual_bank=True,
+                memory_mask_zero_tokens=True,
                 memory_semantic=_delta_memory_config(alpha_step=0.02),
             )
         )
@@ -85,6 +96,7 @@ def test_v4_config_requires_delta_semantic_bank_and_v35_semantics():
                 memory_read_side_loss_weight=0.0,
                 memory_time_consistent_augmentation=False,
                 memory_v4_dual_bank=True,
+                memory_mask_zero_tokens=True,
                 memory_semantic=_delta_memory_config(),
             )
         )
@@ -94,6 +106,7 @@ def test_v4_config_requires_delta_semantic_bank_and_v35_semantics():
         pi0_config.Pi0Config(
             **_v35_kwargs(
                 memory_v4_dual_bank=True,
+                memory_mask_zero_tokens=True,
                 memory_semantic=_delta_memory_config(d_value=64),
             )
         )
@@ -398,3 +411,79 @@ def test_semantic_injection_is_exactly_zero_for_a_fresh_bank_with_finite_backwar
     injected = tiny_v4._v4_inject_semantic(retrieved)
     rms = jnp.sqrt(jnp.mean(jnp.square(injected), axis=-1))
     np.testing.assert_allclose(np.asarray(rms), 0.5 * 12.4, rtol=1e-4)
+
+
+def test_mask_zero_tokens_hides_blank_slots_and_cuts_their_gradient(tiny_v4_seq):
+    """Stage-2a r2 regression: an exactly-zero memory token must be invisible to every other
+    row (no RMSNorm-singularity cotangent into its stream), while nonzero slots stay live."""
+    single = _single_observation()
+    prefix, mask, ar = tiny_v4_seq.embed_prefix(single)
+    prefix_len = mask.shape[1]
+    top_tokens = (prefix_len - tiny_v4_seq.max_token_len) // len(single.images)
+    original_slots = tiny_v4_seq.memory_sem_slot_embedding.value
+
+    def prepare(flag, slot_value):
+        tiny_v4_seq.memory_mask_zero_tokens = flag
+        tiny_v4_seq.memory_sem_slot_embedding.value = slot_value
+        return tiny_v4_seq._v32_prepare_memory_prefix(
+            prefix,
+            mask,
+            ar,
+            tiny_v4_seq.memory.init_state(1),
+            top_token_count=top_tokens,
+            semantic_state=tiny_v4_seq.memory_semantic.init_state(1),
+        )
+
+    def prefix_loss(slot_value, flag):
+        out = prepare(flag, slot_value)
+        return jnp.sum(jnp.square(out["final_prefix"][:, :prefix_len].astype(jnp.float32)))
+
+    zeros = jnp.zeros_like(original_slots)
+    live = jnp.full_like(original_slots, 0.1)
+    tiny_v4_seq.memory_v4_visual_injection = False
+    try:
+        # Fresh banks + visual injection off: every one of the 16 + 3 tokens is exactly zero.
+        prepared_off = prepare(False, zeros)
+        prepared_on = prepare(True, zeros)
+        np.testing.assert_array_equal(np.asarray(prepared_on["memory_tokens"]), 0.0)
+        np.testing.assert_array_equal(np.asarray(prepared_off["memory_valid"]), True)  # noqa: FBT003
+        np.testing.assert_array_equal(np.asarray(prepared_on["memory_valid"]), False)  # noqa: FBT003
+        # A nonzero slot embedding makes only the semantic slots visible again.
+        prepared_live = prepare(True, live)
+        np.testing.assert_array_equal(np.asarray(prepared_live["memory_valid"][0, :16]), False)  # noqa: FBT003
+        np.testing.assert_array_equal(np.asarray(prepared_live["memory_valid"][0, 16:]), True)  # noqa: FBT003
+        # Masking removes the zero slots from the non-memory rows: their outputs still
+        # depend on the observation and are finite.
+        assert bool(jnp.all(jnp.isfinite(prepared_on["final_prefix"])))
+
+        # Gradient contract: the zero-K/V tokens still leak a cotangent into the slot
+        # embedding without the mask; with it, the blank slots receive exactly nothing,
+        # while a live slot embedding trains normally.
+        grad_off = jax.grad(prefix_loss)(zeros, False)
+        grad_on = jax.grad(prefix_loss)(zeros, True)
+        grad_live = jax.grad(prefix_loss)(live, True)
+    finally:
+        tiny_v4_seq.memory_v4_visual_injection = True
+        tiny_v4_seq.memory_mask_zero_tokens = False
+        tiny_v4_seq.memory_sem_slot_embedding.value = original_slots
+    assert float(jnp.linalg.norm(grad_off)) > 0.0
+    np.testing.assert_array_equal(np.asarray(grad_on), 0.0)
+    assert float(jnp.linalg.norm(grad_live)) > 0.0
+
+    # The sequence objective under the Stage-2a recipe stays finite with the mask on and
+    # supervises exactly the same read terms.
+    observation = _v4_sequence_observation()
+    actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)
+    tiny_v4_seq.memory_fact_oracle_writes = True
+    tiny_v4_seq.memory_v4_visual_injection = False
+    tiny_v4_seq.memory_mask_zero_tokens = True
+    try:
+        losses = tiny_v4_seq._compute_sequence_loss_v32(jax.random.key(48), observation, actions, train=False)
+    finally:
+        tiny_v4_seq.memory_fact_oracle_writes = False
+        tiny_v4_seq.memory_v4_visual_injection = True
+        tiny_v4_seq.memory_mask_zero_tokens = False
+    np.testing.assert_array_equal(losses["v4_sem_commit_count"], 2.0)
+    np.testing.assert_array_equal(losses["v4_fact_read_count"], 2.0)
+    for key, value in losses.items():
+        assert np.isfinite(np.asarray(value)).all(), key

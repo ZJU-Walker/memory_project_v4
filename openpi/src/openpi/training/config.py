@@ -2010,6 +2010,7 @@ _CONFIGS = [
             memory_v35_calibration_path=None,
             # ---- dual bank ----
             memory_v4_dual_bank=True,
+            memory_mask_zero_tokens=True,
             memory_semantic=_memory.MemoryConfig(
                 mlp_l2norm=True,
                 blank_initial_output=True,

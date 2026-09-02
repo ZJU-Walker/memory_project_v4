@@ -44,6 +44,7 @@ class _TinyV32(nnx.Module):
     _v32_causal_mask = pi0.Pi0._v32_causal_mask  # noqa: SLF001
     _v32_step_mask = pi0.Pi0._v32_step_mask  # noqa: SLF001
     _v32_suffix_mask = pi0.Pi0._v32_suffix_mask  # noqa: SLF001
+    _v32_memory_columns = pi0.Pi0._v32_memory_columns  # noqa: SLF001
     _v32_content_gate = pi0.Pi0._v32_content_gate  # noqa: SLF001
     _v32_inject_memory = pi0.Pi0._v32_inject_memory  # noqa: SLF001
     _v32_top_patch_valid = pi0.Pi0._v32_top_patch_valid  # noqa: SLF001

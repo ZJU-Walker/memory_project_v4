@@ -174,14 +174,49 @@ and `v4_graft_sources` overlays (Stage 2a takes the trained fact head from the S
 checkpoint; the backbone still comes from pi05_base). Adversarial testing happens through
 the v4 batteries once each stage's pieces exist.
 
-**Stage 2a launched** (`pi05_yam_mem_v4_stage2a`, exp `v4_stage2a_20260901_r1`, GPU 3):
-oracle semantic writes on observable E steps, visual injection off, fact head frozen,
-semantic gate 0.5 with the v3.4 constant c=12.4 (pinned, not calibrated), backbone /
-action expert / semantic core / slot embeddings / read head training at the v3.5 schedule,
-1000 updates. Battery: `scripts/v4_stage2_eval.py --params <ckpt>/params --output-dir ...`
-(normal / reset / donor read-side interventions on decision steps; decision-step subtask CE,
-use-pressure flow, read accuracy; provisional causal gates). H100 recipe: batch 4, 12
-workers (batch >= 6 dies with CUDA_ERROR_ILLEGAL_ADDRESS at step 1).
+**Stage 2a** (`pi05_yam_mem_v4_stage2a`): oracle semantic writes on observable E steps,
+visual injection off, fact head frozen, semantic gate 0.5 with the v3.4 constant c=12.4
+(pinned, not calibrated), backbone / action expert / semantic core / slot embeddings / read
+head training at the v3.5 schedule, 1000 updates. Battery: `scripts/v4_stage2_eval.py
+--params <ckpt>/params --output-dir ...` (normal / reset / donor read-side interventions on
+decision steps; decision-step subtask CE, use-pressure flow, read accuracy; provisional
+causal gates). H100 recipe: SigLIP + embedder frozen (FP32 masters + Adam OOM otherwise),
+batch 2 per device, 12 workers (batch >= 6 on one device dies with
+CUDA_ERROR_ILLEGAL_ADDRESS at step 1).
+
+**Stage 2a r2 postmortem (2026-09-01, GPU 3, stopped at step 644): the memory path never
+trained.** `v4_fact_read_loss` sat at ln(3) (1.075 -> 1.065) while CE/flow fell normally;
+the ckpt-250 leaf diff showed `memory_fact_read_head`, `memory_sem_slot_embedding` and the
+semantic core bitwise unchanged with `action_out_proj` moving 2.3%. Root cause, confirmed
+by `v4/diagnostics/head_grad_probe.py` on the real ckpt-250 + dev batch: the read head's
+own gradient is healthy (norm 0.12-0.15) but `memory_sem_slot_embedding`'s is **inf**, so
+train.py's memory-group pre-clip (`memory_grad_clip=5.0`, `scale = 5/(inf) = 0`) multiplied
+EVERY memory-path gradient by exactly zero from step 0 (`memory_grad_norm=inf` in the log at
+every logging step). The inf is the v3.4 exactly-zero-token-stream RMSNorm singularity: in
+2a all 16 visual tokens (injection off, zero-init slot embeddings) and the 8 semantic tokens
+before the first oracle commit are exactly zero, every late block's RMSNorm at zero
+multiplies the K/V cotangent other rows send them by rsqrt(eps)=1e3, and the chain overflows
+on its way back to the slot embeddings. v36 got away with it only because its visual
+retrieval stops being exactly zero after the first write.
+Fix (this commit): `Pi0Config.memory_mask_zero_tokens` (required for every v4 config) --
+the interface reports per-slot validity (`memory_valid = any(token != 0)`) on the cast
+tokens, and `_v32_prepare_memory_prefix` / `_v32_causal_mask` / `_v32_step_mask` /
+`_v32_suffix_mask` drop invalid slots from every row's key set (a memory row always keeps
+its own key so no softmax row is all-masked; blind rows see valid memory keys + self). An
+exactly-zero token is therefore invisible -- a blank bank cannot influence the policy and no
+cotangent enters its stream -- while written slots stay live. Unit contract:
+`pi0_v4_test.py::test_mask_zero_tokens_hides_blank_slots_and_cuts_their_gradient` (mask
+off: nonzero slot-embedding gradient from zero K/V tokens; mask on: exactly zero for blank
+slots, nonzero for live ones; Stage-2a sequence objective finite with identical read-term
+counts). All v3.2/v3.4/v3.5/v4 model suites pass; the v3.x geometry is bit-identical with
+the flag off (default). Verification on the real model: `v4/diagnostics/memory_group_grad_probe.py`
+(per-leaf memory-group gradient norms, mask off vs on, ckpt-250 + dev batch) must report a
+finite group norm with the mask on before r3 launches. Stage-1's artifact is unaffected
+(the fact head reads h8 before the memory tokens; its gates never touched the late blocks).
+r3 recipe: GPUs 2+3 (`CUDA_VISIBLE_DEVICES=2,3 --fsdp-devices 2 --batch-size 4`, batch 2
+per device), exp `v4_stage2a_20260901_r3`, log `v4/diagnostics/stage2a_20260901_r3.log`;
+health signal = `memory_grad_norm` finite and `v4_fact_read_loss` falling below ln(3) by
+step ~200.
 
 Next after 2a's battery: Stage 2b (predicted writes replace the oracle: flip
 `memory_fact_oracle_writes=False`, unfreeze nothing else) -- the 2a/2b gap is the perception

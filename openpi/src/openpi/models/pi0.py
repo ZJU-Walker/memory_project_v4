@@ -478,6 +478,7 @@ class Pi0(_model.BaseModel):
             self.memory_freeze_injection_gate = config.memory_freeze_injection_gate
             self.memory_conditioner_context = config.memory_conditioner_context
             self.memory_blind_tokens = config.memory_blind_tokens
+            self.memory_mask_zero_tokens = config.memory_mask_zero_tokens
             self.memory_reseed_ce = config.memory_reseed_ce
             self.memory_state_mask_prob = config.memory_state_mask_prob
             self.memory_state_mask_dual_view = config.memory_state_mask_dual_view
@@ -1169,12 +1170,21 @@ class Pi0(_model.BaseModel):
                 "sem_injected_post_cast_rms": sem_post_cast_rms.astype(jnp.float32),
             }
 
+        if getattr(self, "memory_mask_zero_tokens", False):
+            # Per-slot late-block key visibility (Pi0Config.memory_mask_zero_tokens): an
+            # exactly-zero token is invisible to every other row, so no cotangent enters its
+            # zero stream. Decided on the cast tokens the Transformer actually consumes.
+            memory_valid = jnp.any(memory_tokens != 0, axis=-1)
+        else:
+            memory_valid = jnp.ones(memory_tokens.shape[:2], dtype=bool)
+
         return {
             **sem_outputs,
             "cache": cache,
             "h8_all": h8_all,
             "h8_top": h8_top,
             "memory_tokens": memory_tokens,
+            "memory_valid": memory_valid,
             "read_queries": read_queries,
             # None when unconditioned; the conditioned [b, q, d] bank otherwise (diagnostics
             # must pass it to attention_probs to see the attention the write actually used)
@@ -1199,11 +1209,17 @@ class Pi0(_model.BaseModel):
         attention summary of images/state ("readout register" hijack).
         """
         full = make_attn_mask(split_mask, split_ar)
+        split_len = split_mask.shape[1]
+        is_memory = jnp.arange(split_len) >= prefix_len
         if getattr(self, "memory_blind_tokens", False):
-            split_len = split_mask.shape[1]
-            is_memory = jnp.arange(split_len) >= prefix_len
-            full = jnp.where(is_memory[None, :, None], is_memory[None, None, :], full)
-        return full
+            memory_keys = is_memory[None, None, :] & split_mask[:, None, :]
+            full = jnp.where(is_memory[None, :, None], memory_keys, full)
+        # A memory row always sees itself. Under memory_mask_zero_tokens an exactly-zero slot
+        # is absent from split_mask (invisible to every other row); its self-only output is
+        # exactly zero and consumed by nobody, but the row must not be an all-masked softmax.
+        # With every slot valid this is a no-op (self is already inside the visible block).
+        self_key = jnp.eye(split_len, dtype=bool)[None] & is_memory[None, :, None]
+        return full | self_key
 
     def _v32_prepare_memory_prefix(
         self,
@@ -1249,7 +1265,7 @@ class Pi0(_model.BaseModel):
         memory_tokens = prepared["memory_tokens"]
 
         split_tokens = jnp.concatenate([h8_all, memory_tokens], axis=1)
-        split_mask = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool)], axis=1)
+        split_mask = jnp.concatenate([prefix_mask, prepared["memory_valid"]], axis=1)
         split_ar = jnp.concatenate([prefix_ar, jnp.zeros((batch, mem_len), dtype=prefix_ar.dtype)], axis=1)
         late_mask = self._pad_attention_columns(self._v32_split_late_mask(split_mask, split_ar, prefix_len), capacity)
         split_positions = jnp.concatenate(
@@ -1270,34 +1286,59 @@ class Pi0(_model.BaseModel):
             "final_prefix": final_prefix,
         }
 
-    def _v32_causal_mask(self, prefix_mask: at.Array, causal_mask: at.Array) -> at.Array:
+    def _v32_memory_columns(self, batch: int, memory_valid: at.Array | None) -> at.Array:
+        """Late-block key visibility of the memory block: every slot (v3.x geometry) or the
+        interface's per-slot validity (``memory_mask_zero_tokens``, see
+        :meth:`_v32_prepare_memory_interface`)."""
+        mem_len = self._memory_token_total
+        if memory_valid is None:
+            return jnp.ones((batch, mem_len), dtype=bool)
+        if memory_valid.shape != (batch, mem_len):
+            raise ValueError(f"memory_valid must have shape {(batch, mem_len)}; got {memory_valid.shape}.")
+        return memory_valid
+
+    def _v32_causal_mask(
+        self, prefix_mask: at.Array, causal_mask: at.Array, memory_valid: at.Array | None = None
+    ) -> at.Array:
         batch, causal_len = causal_mask.shape
         mem_len = self._memory_token_total
+        memory_cols = self._v32_memory_columns(batch, memory_valid)
         causal_self = jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))[None] & causal_mask[:, None, :]
         prefix_rows = einops.repeat(prefix_mask, "b p -> b c p", c=causal_len)
         early = jnp.concatenate(
             [prefix_rows, jnp.zeros((batch, causal_len, mem_len), dtype=bool), causal_self], axis=-1
         )
-        late = jnp.concatenate([prefix_rows, jnp.ones((batch, causal_len, mem_len), dtype=bool), causal_self], axis=-1)
+        late = jnp.concatenate(
+            [prefix_rows, einops.repeat(memory_cols, "b m -> b c m", c=causal_len), causal_self], axis=-1
+        )
         return self._v32_layer_mask(early, late)
 
-    def _v32_step_mask(self, prefix_mask: at.Array, generated_count: at.Array) -> at.Array:
+    def _v32_step_mask(
+        self, prefix_mask: at.Array, generated_count: at.Array, memory_valid: at.Array | None = None
+    ) -> at.Array:
         batch = prefix_mask.shape[0]
         mem_len = self._memory_token_total
+        memory_cols = self._v32_memory_columns(batch, memory_valid)
         gen_valid = jnp.broadcast_to(
             jnp.arange(self.causal_token_len)[None, :] < generated_count, (batch, self.causal_token_len)
         )
         early = jnp.concatenate([prefix_mask, jnp.zeros((batch, mem_len), dtype=bool), gen_valid], axis=1)
-        late = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool), gen_valid], axis=1)
+        late = jnp.concatenate([prefix_mask, memory_cols, gen_valid], axis=1)
         return self._v32_layer_mask(early[:, None, :], late[:, None, :])
 
     def _v32_suffix_mask(
-        self, prefix_mask: at.Array, causal_mask: at.Array, suffix_mask: at.Array, suffix_ar: at.Array
+        self,
+        prefix_mask: at.Array,
+        causal_mask: at.Array,
+        suffix_mask: at.Array,
+        suffix_ar: at.Array,
+        memory_valid: at.Array | None = None,
     ) -> at.Array:
         batch = prefix_mask.shape[0]
         mem_len = self._memory_token_total
+        memory_cols = self._v32_memory_columns(batch, memory_valid)
         early_view = jnp.concatenate([prefix_mask, jnp.zeros((batch, mem_len), dtype=bool), causal_mask], axis=1)
-        late_view = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool), causal_mask], axis=1)
+        late_view = jnp.concatenate([prefix_mask, memory_cols, causal_mask], axis=1)
         suffix_self = make_attn_mask(suffix_mask, suffix_ar)
         early = jnp.concatenate(
             [einops.repeat(early_view, "b p -> b s p", s=suffix_mask.shape[1]), suffix_self], axis=-1
@@ -2577,7 +2618,7 @@ class Pi0(_model.BaseModel):
         )
         (_, _), cache = self.PaliGemma.llm(
             [causal_emb, None],
-            mask=self._v32_causal_mask(prefix_mask, causal_mask),
+            mask=self._v32_causal_mask(prefix_mask, causal_mask, memory_valid=prepared["memory_valid"]),
             positions=causal_positions,
             kv_cache=cache,
             cache_position=prefix_len + mem_len,
@@ -2587,7 +2628,9 @@ class Pi0(_model.BaseModel):
         suffix_tokens, suffix_mask, suffix_ar, adarms_cond = self.embed_suffix(
             preprocessed, action_noise, flow_time
         )
-        suffix_attention_mask = self._v32_suffix_mask(prefix_mask, causal_mask, suffix_mask, suffix_ar)
+        suffix_attention_mask = self._v32_suffix_mask(
+            prefix_mask, causal_mask, suffix_mask, suffix_ar, memory_valid=prepared["memory_valid"]
+        )
         suffix_positions = (
             prefix_len
             + mem_len
@@ -2786,12 +2829,14 @@ class Pi0(_model.BaseModel):
         mem_len = self._memory_token_total
 
         def memory_suffix_mask(suffix_mask, suffix_ar):
-            return self._v32_suffix_mask(prefix_mask, causal_mask & ~causal_fast, suffix_mask, suffix_ar)
+            return self._v32_suffix_mask(
+                prefix_mask, causal_mask & ~causal_fast, suffix_mask, suffix_ar, memory_valid=prepared["memory_valid"]
+            )
 
         memory_flow, memory_ce = losses_from_cache(
             cache=prepared["cache"],
             final_prefix=prepared["final_prefix"],
-            causal_attention_mask=self._v32_causal_mask(prefix_mask, causal_mask),
+            causal_attention_mask=self._v32_causal_mask(prefix_mask, causal_mask, memory_valid=prepared["memory_valid"]),
             causal_offset=prefix_len + mem_len,
             suffix_attention_mask=memory_suffix_mask,
             suffix_offset=prefix_len + mem_len + causal_len,
@@ -3231,7 +3276,7 @@ class Pi0(_model.BaseModel):
                 )
                 (causal_out, _), _ = self.PaliGemma.llm(
                     [causal_emb, None],
-                    mask=self._v32_causal_mask(prefix_mask, causal_mask_k),
+                    mask=self._v32_causal_mask(prefix_mask, causal_mask_k, memory_valid=prepared["memory_valid"]),
                     positions=causal_positions,
                     kv_cache=prepared["cache"],
                     cache_position=prefix_len + mem_len,
@@ -3533,6 +3578,7 @@ class Pi0(_model.BaseModel):
         final_prefix = prepared["final_prefix"]
         write_tokens = prepared["write_tokens"]
         retrieved = prepared["retrieved"]
+        memory_valid = prepared["memory_valid"]
         anchor_inputs = (v35_anchor_key, v35_anchor_value, v35_anchor_delay_steps)
         if any(value is not None for value in anchor_inputs) and not all(value is not None for value in anchor_inputs):
             raise ValueError("v35_anchor_key, v35_anchor_value, and v35_anchor_delay_steps must be provided together.")
@@ -3602,7 +3648,7 @@ class Pi0(_model.BaseModel):
             )
             (causal_out, _), kv_cache = self.PaliGemma.llm(
                 [causal_emb, None],
-                mask=self._v32_causal_mask(prefix_mask, gen_mask),
+                mask=self._v32_causal_mask(prefix_mask, gen_mask, memory_valid=memory_valid),
                 positions=causal_positions,
                 kv_cache=kv_cache,
                 cache_position=gen_base,
@@ -3633,7 +3679,9 @@ class Pi0(_model.BaseModel):
                 suffix_positions = gen_base + self.causal_token_len + jnp.cumsum(suffix_mask, axis=-1) - 1
                 (_, suffix_out), _ = self.PaliGemma.llm(
                     [None, suffix_tokens],
-                    mask=self._v32_suffix_mask(prefix_mask, gen_mask, suffix_mask, suffix_ar),
+                    mask=self._v32_suffix_mask(
+                        prefix_mask, gen_mask, suffix_mask, suffix_ar, memory_valid=memory_valid
+                    ),
                     positions=suffix_positions,
                     kv_cache=kv_cache,
                     adarms_cond=[None, adarms_cond],
@@ -3674,7 +3722,7 @@ class Pi0(_model.BaseModel):
             token_emb = self.PaliGemma.llm(previous[:, None], method="embed")
             (out, _), cache = self.PaliGemma.llm(
                 [token_emb, None],
-                mask=self._v32_step_mask(prefix_mask, index),
+                mask=self._v32_step_mask(prefix_mask, index, memory_valid=memory_valid),
                 positions=jnp.broadcast_to(gen_base + index - 1, (batch, 1)),
                 kv_cache=cache,
                 cache_position=gen_base + index - 1,
@@ -3688,7 +3736,7 @@ class Pi0(_model.BaseModel):
         last_emb = self.PaliGemma.llm(previous[:, None], method="embed")
         _, kv_cache = self.PaliGemma.llm(
             [last_emb, None],
-            mask=self._v32_step_mask(prefix_mask, generated),
+            mask=self._v32_step_mask(prefix_mask, generated, memory_valid=memory_valid),
             positions=jnp.broadcast_to(gen_base + generated - 1, (batch, 1)),
             kv_cache=kv_cache,
             cache_position=gen_base + generated - 1,
@@ -3709,7 +3757,9 @@ class Pi0(_model.BaseModel):
             suffix_positions = gen_base + self.causal_token_len + jnp.cumsum(suffix_mask, axis=-1) - 1
             (_, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
-                mask=self._v32_suffix_mask(prefix_mask, causal_live, suffix_mask, suffix_ar),
+                mask=self._v32_suffix_mask(
+                    prefix_mask, causal_live, suffix_mask, suffix_ar, memory_valid=memory_valid
+                ),
                 positions=suffix_positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
@@ -4431,7 +4481,7 @@ class Pi0(_model.BaseModel):
             causal_positions = jnp.broadcast_to(prefix_len + mem_len + jnp.arange(causal_len)[None], (b, causal_len))
             (causal_out, _), kv_cache = self.PaliGemma.llm(
                 [causal_emb, None],
-                mask=self._v32_causal_mask(prefix_mask, causal_mask_k),
+                mask=self._v32_causal_mask(prefix_mask, causal_mask_k, memory_valid=prepared["memory_valid"]),
                 positions=causal_positions,
                 kv_cache=kv_cache,
                 cache_position=prefix_len + mem_len,
@@ -4457,7 +4507,13 @@ class Pi0(_model.BaseModel):
             suffix_positions = prefix_len + mem_len + causal_len + jnp.cumsum(suffix_mask, axis=-1) - 1
             (_, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
-                mask=self._v32_suffix_mask(prefix_mask, causal_mask_k & ~x["causal_fast"], suffix_mask, suffix_ar),
+                mask=self._v32_suffix_mask(
+                    prefix_mask,
+                    causal_mask_k & ~x["causal_fast"],
+                    suffix_mask,
+                    suffix_ar,
+                    memory_valid=prepared["memory_valid"],
+                ),
                 positions=suffix_positions,
                 kv_cache=jax.lax.stop_gradient(kv_cache),
                 adarms_cond=[None, adarms_cond],

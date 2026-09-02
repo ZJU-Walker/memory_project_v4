@@ -261,6 +261,15 @@ class Pi0Config(_model.BaseModelConfig):
     # nothing (content ablation of the visual retrieval) so the fused stream sees only the
     # semantic tokens. The v3.5 gate/calibration contract on the visual path is untouched.
     memory_v4_visual_injection: bool = True
+    # Exactly-zero memory tokens (a blank bank's zero retrieval, a switched-off visual
+    # injection, zero_read) are removed from the late-block key set of EVERY row and attend
+    # only to themselves, so no cotangent ever enters an all-zero token stream. Such a stream
+    # sits at the RMSNorm singularity of every late block: the K/V cotangent other rows send
+    # it is amplified by rsqrt(eps)=1e3 per block on its way back to the slot embedding, the
+    # memory-group gradient norm overflows to inf, and the memory-group pre-clip then scales
+    # every memory-path gradient to exactly zero (Stage 2a r2: read head, slot embeddings and
+    # semantic core bitwise unchanged for 600 steps). Required for v4 dual-bank models.
+    memory_mask_zero_tokens: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -426,6 +435,11 @@ class Pi0Config(_model.BaseModelConfig):
                 if not self.memory_v35_enabled:
                     raise ValueError(
                         "memory_v4_dual_bank builds on the v3.5 sequence semantics; set memory_v35_enabled=True."
+                    )
+                if not self.memory_mask_zero_tokens:
+                    raise ValueError(
+                        "memory_v4_dual_bank requires memory_mask_zero_tokens=True: a blank bank injects "
+                        "exactly-zero tokens whose late-block backward overflows the memory-group clip."
                     )
                 if (
                     self.memory_semantic.write_rule != "delta_output"
