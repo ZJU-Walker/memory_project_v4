@@ -696,6 +696,32 @@ deployment path ahead of the remaining confirmations. Changes:
   null), `client_memory_v4_test.py` (metadata guard, readout). CPU smoke of the real path:
   `v4/diagnostics/server_smoke_cpu.py` (create_policy + warmup + 3 requests on ckpt-999).
 
+Robot-trial runbook (v4):
+
+1. GPU box (inside the SLURM job that owns the H100; the evaluation queue must be killed
+   first if it is still running: `pkill -f v4_closed_loop_eval; pkill -f v4_side_flip_eval`
+   plus the `run_*_4c_r1.sh` runners):
+   `bash /iris/u/kewalk/memory_project_v4/v4/diagnostics/run_server_v4.sh 8000`
+   -- warms up (two compiles, a few minutes), prints "warmup done; memory reset", then
+   serves. Note the IP it prints (`hostname -I`, first address; iris-hgx-1 = 10.79.12.252).
+2. Robot computer (`/home/david/memory_project/openpi`, user david; needs gello_software,
+   openpi_client, opencv, ffmpeg): copy `examples/yam/client_memory_v4.py` and, for the
+   long keepalive, `packages/openpi-client/src/openpi_client/websocket_client_policy.py`
+   from this worktree (the client falls back to the old signature if the package there is
+   not updated). Then:
+   `python examples/yam/client_memory_v4.py --host <gpu-ip> --port 8000 --dry-run`
+   (contract check, no hardware) and for the trial
+   `python examples/yam/client_memory_v4.py --host <gpu-ip> --port 8000 --prompt "find the banana"`
+   (or `"find the grey pepper box"`). `r` resets both banks for a new episode, `q` stops.
+3. What to watch in the overlay: during "inspect both bins" the `sees:` line should name the
+   sides with confidence >= 0.9 and mark commits (`*`); afterwards `bank:` must keep both
+   facts while the lids are closed; at "wait; target bin is ..." the subtask must name the
+   side the bank holds for the prompted object. A wrong side with a correct bank is a
+   read/decision failure; a wrong bank is a write failure (the head mis-saw the scene).
+4. Scope: one scene, banana vs grey pepper box, left vs right, 54 training episodes;
+   expect nothing outside that. One control client at a time (the server holds a single
+   episode memory).
+
 Historical (2b-era) plan, kept for the record: battery plan for 2b = `v4_stage2_eval.py`
 + `v4_side_flip_eval.py` on ckpt 500/999; the 2a/2b gap = perception error of the
 predicted write path (watch `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the
