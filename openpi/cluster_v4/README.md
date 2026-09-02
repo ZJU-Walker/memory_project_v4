@@ -353,7 +353,30 @@ ckpt-500 was still converging (normal side accuracy 0.83, follows-content 0.77),
 1000-update budget at batch 2 is needed. 2a/2b gap at ckpt-999 = 0 on every use/read
 metric: the frozen Stage-1 head's writes carry no measurable perception error on the dev
 split (commit == eligible at ~7 per sequence throughout training). Reports:
-`stage2_eval_2b_r1_{999,500}/stage2_eval.json`, `side_flip_2b_r1_{999,500}/side_flip_eval.json`. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+`stage2_eval_2b_r1_{999,500}/stage2_eval.json`, `side_flip_2b_r1_{999,500}/side_flip_eval.json`.
+
+**Stage 4 launched 2026-09-02 05:14 PDT** (user instruction: keep training on the 1-H100 job;
+document every modification). Config `pi05_yam_mem_v4_stage4` (commit `dcdd198`) = Stage 2b +
+the VISUAL bank live: `memory_v4_visual_injection=True`, visual `memory_injection_c=12.4`
+(pinned like the semantic bank -- the tanh_rms max(rms, tau) normalisation puts any read
+with rms > tau at 0.5*c regardless of its raw scale, so one residual constant serves both
+banks; the v3.5 per-bank calibration is deliberately not run under the v4 light protocol),
+v3.5 write/read side losses 0.3/0.3, and the visual subsystem unfrozen for the first time in
+v4 (Titans core `memory/`, read/write query compressors, write-query conditioner, side
+heads). Still frozen: both injection gates, the Stage-1 fact head, SigLIP, the embedder.
+Fresh from pi05_base + Stage-1 head; predicted semantic writes. Config diff vs 2b verified:
+{memory_v4_visual_injection, memory_injection_c, memory_write_side_loss_weight,
+memory_read_side_loss_weight} + freeze_filter, nothing else. Exp `v4_stage4_20260902_r1`,
+job 17192955, launcher `BATCH=2 ACCUM=1 run_train_1gpu.sh pi05_yam_mem_v4_stage4
+v4_stage4_20260902_r1` (global batch 2, ~2.7 h; auto-resume on preemption, max 3). Logs
+`train_v4_stage4_20260902_r1{.log,_status.log}`. Watch: `memory_grad_norm` (the visual
+recurrence is trainable now -- the v3.4 explosion cycles were on this path; the memory-group
+clip at 5.0 and the state-cotangent clip are the guards), `v35_write_side_loss` /
+`v35_read_side_loss` (visual writer/reader side supervision), `v35_injected_pre_cast_rms_sum`
+(visual injection live, not zero), and the semantic metrics as in 2b. Batteries after 999:
+`v4_stage2_eval.py` + `v4_side_flip_eval.py` with `--config-name pi05_yam_mem_v4_stage4`
+(the semantic reset/donor interventions still apply; a visual-bank intervention is not
+implemented yet and is the next battery item), then dual-bank `sample_with_memory`. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
