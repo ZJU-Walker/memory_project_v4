@@ -454,7 +454,26 @@ flow 0.0115. Batteries started 11:58 on the H100 job. H200 note: the 1-GPU job 1
 iris-hgx-2 was checked as a second eval GPU and rejected for now -- that node reads /iris at
 ~11 MB/s (468 MiB CUDA library in 45 s, load average 158), so a JAX import takes minutes and
 the matmul smoke test timed out twice; it has a 17 TB local /scr, so any future use there
-must stage the venv, checkpoints and dataset locally first. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
+must stage the venv, checkpoints and dataset locally first.
+
+**Stage 4c r1, ckpt-999 side-flip results (2026-09-02 12:13 / 12:27):**
+
+| ckpt-999, first decision step (all 230 steps) | semantic-bank interventions | visual-bank interventions |
+|---|---|---|
+| own memory: names the true side | 0.938 (0.939), +10.5 nats | 0.917 (0.926), +10.2 nats |
+| bank wiped | **0.354** (0.639) | **0.896** (0.939) |
+| donor implies other side: flips to it | **23/24 = 0.958** (0.789) | 0.042 (0.035) |
+| donor implies same side: stays correct | 0.958 (0.966) | 0.875 (0.888) |
+| follows the (semantic) content | **0.958** (0.878) | 0.458 (0.465) = indifferent |
+
+Reading: the decision follows the SEMANTIC bank's content (wipe it -> chance; swap it -> the
+answer flips 23/24) and is indifferent to the VISUAL bank (wipe or swap it -> unchanged,
+margin shift ~0). That is the corrected Stage-4 criterion, both halves. The 2b -> 4c cost of
+adding a live, unsupervised visual bank: first-step normal accuracy 1.000 -> 0.94 and
+follows-content 1.000 -> 0.96 (2-3 windows of 48; the small normal-accuracy difference
+between the two runs of the same checkpoint, 0.938 vs 0.917, is bf16 nondeterminism on
+borderline windows). Remaining ckpt-999 runs (gate battery semantic / visual, both-bank
+side-flip) and the ckpt-500 set are appended when they land. Battery plan for 2b: `v4_stage2_eval.py` + `v4_side_flip_eval.py` on
 ckpt 500/999; the 2a/2b gap = perception error of the predicted write path (watch
 `v4_sem_commit_count` / `v4_sem_write_eligible_count` in the log for the write rate).
 
