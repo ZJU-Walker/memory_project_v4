@@ -137,7 +137,12 @@ def main() -> None:
         print("[upload] dry run; nothing uploaded")
         return
 
-    api.create_repo(repo, repo_type="model", private=args.private, exist_ok=True)
+    # Only create when absent: a fine-grained token scoped to an existing repo may lack the
+    # "create repositories" permission, and create_repo(exist_ok=True) still calls the create endpoint.
+    try:
+        api.repo_info(repo, repo_type="model")
+    except HfHubHTTPError:
+        api.create_repo(repo, repo_type="model", private=args.private, exist_ok=True)
     started = time.time()
     try:
         api.upload_folder(
