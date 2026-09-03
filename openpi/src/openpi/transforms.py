@@ -462,27 +462,37 @@ def is_v35_memory_window(window: np.ndarray | None) -> bool:
     )
 
 
-def memory_critical_is_sparse(frame_index: int, window: np.ndarray) -> bool:
+def memory_critical_is_sparse(frame_index: int, window: np.ndarray, *, allow_sparse: bool = True) -> bool:
     """Stable 50/50 family assignment for v3.5 eligible starts.
 
     The sampler subsequently balances family x manifest cell x episode.  Assignment is a pure
     function of the raw start and episode window, so the transform can reproduce it in worker
-    processes without hidden RNG state.
+    processes without hidden RNG state.  With ``allow_sparse=False`` every start is natural
+    (dense): the skip-O family's premise -- O transitions are provably non-writing, so they
+    collapse into one analytic decay -- is false under a write-every-step clock, where the
+    deployed policy writes on every O tick.
     """
-    if not is_v35_memory_window(window):
+    if not allow_sparse or not is_v35_memory_window(window):
         return False
     return (int(frame_index) - int(window[0])) % 2 == 0
 
 
 def memory_critical_layout(
-    frame_index: int, window: np.ndarray, *, stride: int, lookahead: int, num_steps: int
+    frame_index: int,
+    window: np.ndarray,
+    *,
+    stride: int,
+    lookahead: int,
+    num_steps: int,
+    allow_sparse: bool = True,
 ) -> MemoryCriticalLayout:
     """Return the exact v3.5 natural or sparse E->D layout for a critical start.
 
     Every accepted layout contains the per-grid final eligible E anchor and at least one strict
     D step.  Sparse layouts keep the last one or two E samples plus D samples, and encode the
     omitted valid non-E transitions on the first D step.  Any missing anchor/D candidate raises
-    instead of silently yielding a state-invalid training example.
+    instead of silently yielding a state-invalid training example.  ``allow_sparse=False``
+    forces the natural (dense) layout for every start (see memory_critical_is_sparse).
     """
     if not is_v35_memory_window(window):
         endpoint = memory_critical_endpoint(
@@ -525,7 +535,7 @@ def memory_critical_layout(
     if endpoint <= final_e:
         raise ValueError(f"v3.5 critical start {frame_index} orders D step {endpoint} before final E step {final_e}.")
 
-    sparse = memory_critical_is_sparse(frame_index, window)
+    sparse = memory_critical_is_sparse(frame_index, window, allow_sparse=allow_sparse)
     if not sparse:
         keep = np.arange(endpoint + 1, dtype=np.int32)
         first_d = int(np.nonzero(in_d)[0][0])
@@ -665,6 +675,10 @@ class BuildMemorySequence(DataTransformFn):
     # Required for v3.5's second, item-level proof that every analytically omitted transition
     # is semantic O.  Empty preserves the legacy constructor/output path.
     occlusion_subtasks: tuple[str, ...] = ()
+    # False forces the natural (dense) layout for every critical start; required when the
+    # clock writes on every step (skip-O gaps would stand for O ticks that do write at
+    # deployment). Must agree with the sampler (memory_sparse_skip_o_prob > 0).
+    allow_sparse_skip_o: bool = True
 
     @staticmethod
     def _compact_sparse_fields(data: DataDict, keep: np.ndarray, num_steps: int) -> None:
@@ -730,7 +744,12 @@ class BuildMemorySequence(DataTransformFn):
         if memory_critical:
             if v35:
                 layout = memory_critical_layout(
-                    frame_index, window, stride=self.stride, lookahead=self.subtask_lookahead, num_steps=num_steps
+                    frame_index,
+                    window,
+                    stride=self.stride,
+                    lookahead=self.subtask_lookahead,
+                    num_steps=num_steps,
+                    allow_sparse=self.allow_sparse_skip_o,
                 )
                 if layout.sparse_skip_o:
                     gap_slot = int(np.nonzero(layout.decay_gap_before > 0)[0][0]) if layout.n_delay > 0 else -1
@@ -921,6 +940,16 @@ class MemoryV34Labels(DataTransformFn):
                 raise ValueError("seq_decay_gap_before cannot be negative.")
             if np.any((decay_gap > 0) & (~step_mask | evidence_write)):
                 raise ValueError("analytic gaps may precede only valid non-E/read steps.")
+            if self.write_every_step and np.any(decay_gap > 0):
+                # Fail closed: an analytic skip-O gap stands for omitted O transitions that
+                # did NOT write. Under write_every_step the deployed policy writes on every
+                # tick, so a compacted sparse window would train a bank state that never
+                # occurs at inference. The sampler must hand this transform dense windows only
+                # (memory_sparse_skip_o_prob=0 -> BuildMemorySequence(allow_sparse_skip_o=False)).
+                raise ValueError(
+                    "write_every_step requires dense memory windows: got an analytic skip-O gap "
+                    f"at steps {np.nonzero(decay_gap > 0)[0].tolist()}."
+                )
 
             # Read happens before the current transition.  A fence cuts gradient reach at this
             # step's entry but does not erase memory content; the current step's E write becomes

@@ -1524,6 +1524,10 @@ def _sequence_sampling_info(
         critical_family = np.full(len(episode), -1, dtype=np.int8)  # 0 natural, 1 sparse skip-O
         sampled_e_count = np.zeros(len(episode), dtype=np.int32)
         critical_delay = np.full(len(episode), -1, dtype=np.int32)
+        # memory_sparse_skip_o_prob is 0.5 (parity-split natural/skip-O families) or 0.0
+        # (dense only; required under write_every_step, where skipped O ticks would write).
+        allow_sparse = data_config.memory_sparse_skip_o_prob > 0
+        families = (0, 1) if allow_sparse else (0,)
         # Each memory-critical start truncates at memory_critical_endpoint's DETERMINISTIC
         # step, so its exact valid length is known here and bucket assignment is precise --
         # BuildMemorySequence recomputes the identical endpoint at fetch time. (A per-draw
@@ -1538,6 +1542,7 @@ def _sequence_sampling_info(
                         stride=stride,
                         lookahead=data_config.subtask_lookahead,
                         num_steps=max_steps,
+                        allow_sparse=allow_sparse,
                     )
                 except ValueError:
                     # Individual raw start residues may miss a short D interval.  They receive
@@ -1572,7 +1577,7 @@ def _sequence_sampling_info(
                 # floor remains one for genuinely short evidence intervals.  Apply this per
                 # family: a two-E natural candidate must not accidentally delete an episode's
                 # only valid one-E skip-O candidate.
-                for family in (0, 1):
+                for family in families:
                     family_candidates = episode_candidates & (critical_family == family)
                     two_e = family_candidates & (sampled_e_count >= 2)
                     if np.any(two_e):
@@ -1580,7 +1585,7 @@ def _sequence_sampling_info(
                 remaining = mc_ok & (episode == e)
                 if not np.any(remaining):
                     missing_any.append(int(e))
-                elif not np.any(remaining & (critical_family == 1)):
+                elif allow_sparse and not np.any(remaining & (critical_family == 1)):
                     missing_sparse.append(int(e))
             if missing_any or missing_sparse:
                 raise ValueError(
@@ -1599,7 +1604,7 @@ def _sequence_sampling_info(
                 np.percentile(per_episode_e, [0, 10, 50, 90, 100]).tolist(),
                 one_e.tolist(),
             )
-            for family, name in ((0, "natural"), (1, "skip_o")):
+            for family, name in ((0, "natural"), (1, "skip_o"))[: len(families)]:
                 delay = critical_delay[mc_ok & (critical_family == family)]
                 if len(delay) == 0:
                     raise ValueError(f"v3.5 active split has no {name} critical candidates.")
@@ -1684,12 +1689,12 @@ def _sequence_sampling_info(
             # exact cell composition inside each individual batch.
             strata: dict[tuple[int, int], dict[int, np.ndarray]] = {}
             for e in mc_episodes:
-                for family in (0, 1):
+                for family in families:
                     idx = np.nonzero(mc_ok & (episode == e) & (critical_family == family))[0]
                     if len(idx):
                         strata.setdefault((family, int(info["memory_cell"][e])), {})[int(e)] = idx
             expected = {
-                (family, int(cell)) for family in (0, 1) for cell in np.unique(info["memory_cell"][allowed_episode])
+                (family, int(cell)) for family in families for cell in np.unique(info["memory_cell"][allowed_episode])
             }
             missing_strata = sorted(expected - set(strata))
             if missing_strata:

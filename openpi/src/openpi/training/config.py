@@ -254,7 +254,14 @@ class DataConfig:
             raise ValueError(
                 "v3.5 analytic skip requires disjoint evidence and occlusion labels so O is provably non-writing."
             )
-        if self.memory_sparse_skip_o_prob != 0.5:
+        if self.memory_write_every_step:
+            if self.memory_sparse_skip_o_prob != 0.0:
+                raise ValueError(
+                    "memory_write_every_step requires memory_sparse_skip_o_prob=0.0: the skip-O family "
+                    "collapses O transitions into an analytic decay, but a write-every-step policy "
+                    "writes on every O tick at deployment, so sparse windows are no longer exact."
+                )
+        elif self.memory_sparse_skip_o_prob != 0.5:
             raise ValueError("v3.5 Revision 4 requires a 50/50 natural/skip-O critical mixture.")
         if self.memory_episode_manifest_path is None or self.memory_manifest_split is None:
             raise ValueError("v3.5 data requires a versioned episode manifest and an explicit active split.")
@@ -666,6 +673,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
                     block_steps=model_config.memory_block_steps,
                     subtask_lookahead=base_config.subtask_lookahead,
                     occlusion_subtasks=tuple(base_config.memory_occlusion_subtasks),
+                    allow_sparse_skip_o=base_config.memory_sparse_skip_o_prob > 0,
                 ),
             )
         data_transforms = _transforms.Group(inputs=input_transforms, outputs=[yam_policy.YamOutputs()])
@@ -2489,91 +2497,12 @@ _CONFIGS = [
                 num_workers=12,
                 fsdp_devices=1,
             ),
-            TrainConfig(
-                name="pi05_yam_mem_v4_stage4d",
-                v4_protocol=True,
-                # Stage 4d (2026-09-02, after the first robot trial of Stage 4c): the same model
-                # and losses as Stage 4c, trained the way it is deployed. (a) Both banks may
-                # commit on EVERY valid step (`memory_write_every_step`): the semantic bank
-                # still commits only where the fact head is confident and non-unknown, the
-                # visual bank stores every frame -- on the robot the server allows a write at
-                # every tick, and Stage 4c's evidence-only visual writes made the start pose
-                # (lids closed, arms at rest, visual bank already written) look like the
-                # post-inspection waiting state, so the policy waited or guessed a side.
-                # (b) More windows start at frame 0 (`memory_slice_prob` 0.5 -> 0.4: full-episode
-                # starts 25% -> 30% of the mix) so "blank banks + rest pose -> open both lids"
-                # is supervised directly. (c) 6000 updates instead of 1000: the pick-up motion,
-                # not the memory decision, needs the steps (Stage 4c's action head saw ~2000
-                # windows from the generic pi05 base). Everything else is Stage 4c.
-                model=dataclasses.replace(
-                    v4_model,
-                    memory_fact_oracle_writes=False,
-                    memory_v4_visual_injection=True,
-                    memory_fact_loss_weight=0.0,
-                    memory_fact_read_loss_weight=0.3,
-                    memory_sem_injection_c=12.4,
-                    memory_sem_injection_tau=0.02,
-                    memory_sem_injection_gate_init=0.5,
-                    memory_injection_c=12.4,
-                    memory_injection_tau=0.02,
-                    memory_injection_gate_init=0.5,
-                    memory_write_side_loss_weight=1e-6,
-                    memory_read_side_loss_weight=1e-6,
-                ),
-                data=dataclasses.replace(
-                    v4_data,
-                    base_config=dataclasses.replace(
-                        v4_data.base_config,
-                        memory_write_every_step=True,
-                        memory_slice_prob=0.4,
-                    ),
-                ),
-                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
-                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
-                freeze_filter=nnx_utils.PathRegex(
-                    r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed"
-                    r"|memory/gate|memory_gate|memory_inject_w|memory_sem_inject_w|memory_semantic/gate"
-                    r"|memory_write_side_head|memory_read_side_head"
-                    r"|PaliGemma/img/|PaliGemma/llm/embedder).*"
-                ),
-                batch_size=2,
-                gradient_accumulation_steps=1,
-                lr_schedule=_optimizer.CosineDecaySchedule(
-                    warmup_steps=200,
-                    peak_lr=5e-5,
-                    decay_steps=10_000,
-                    decay_lr=5e-5,
-                ),
-                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-                memory_grad_clip=5.0,
-                ema_decay=None,
-                probe_lr=1e-2,
-                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
-                    "gs://openpi-assets/checkpoints/pi05_base/params",
-                    matched_allowlist=(
-                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
-                    ),
-                    fresh_init_allowlist=(
-                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
-                    ),
-                ),
-                v4_graft_sources=(
-                    (
-                        r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed).*",
-                        str(
-                            _project_paths.project_path(
-                                _project_paths.V4_CHECKPOINTS_DIR
-                                / "pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params"
-                            )
-                        ),
-                    ),
-                ),
-                num_train_steps=6_000,
-                save_interval=500,
-                keep_period=500,
-                num_workers=12,
-                fsdp_devices=1,
-            ),
+            # Stage 4d (2026-09-02) lived here: Stage 4c trained with writes on every valid step.
+            # Its r1 run collapsed the semantic read accuracy to chance by update 1000 (see
+            # cluster_v4/README.md) and its data recipe kept the skip-O windows, which the
+            # write-every-step rule below now rejects. The config is retired; its r1
+            # checkpoints (v4/checkpoints/pi05_yam_mem_v4_stage4d/.../{500,1000}) evaluate and
+            # serve under pi05_yam_mem_v4_stage4e (identical model and inference path).
             TrainConfig(
                 name="pi05_yam_mem_v4_stage4e",
                 v4_protocol=True,
@@ -2593,7 +2522,13 @@ _CONFIGS = [
                 #     supervises the truth only where the fact is visible;
                 # (c) the write logits carry gradient only on observable real slots
                 #     (`memory_fact_write_grad_observable_only`), i.e. the Stage-4c gradient
-                #     structure under the Stage-4d write schedule.
+                #     structure under the Stage-4d write schedule;
+                # (d) dense memory windows only (`memory_sparse_skip_o_prob=0`): the v3.5 skip-O
+                #     family compacts the O transitions between E and D into one analytic decay,
+                #     which was exact while O never wrote; the deployed always-write policy writes
+                #     on every O tick, so half of 4d's decision windows trained a bank state that
+                #     never occurs at inference. MemoryV34Labels refuses skip-O gaps under
+                #     write_every_step.
                 model=dataclasses.replace(
                     v4_model,
                     memory_fact_oracle_writes=False,
@@ -2615,6 +2550,7 @@ _CONFIGS = [
                     base_config=dataclasses.replace(
                         v4_data.base_config,
                         memory_write_every_step=True,
+                        memory_sparse_skip_o_prob=0.0,
                         memory_slice_prob=0.4,
                     ),
                 ),

@@ -145,7 +145,6 @@ def test_memory_v34_labels_write_every_step_keeps_observability_on_evidence_fram
     4d r1 derived it from the clock and marked every frame observable)."""
     from openpi.training import data_loader_v35_test as v35t
 
-    build = transforms.BuildMemorySequence(stride=15, action_horizon=15, block_steps=4, occlusion_subtasks=(v35t.CLOSE,))
     facts = transforms.MemoryV4FactLabels(num_fact_slots=2, num_fact_targets=3)
 
     def run(every_step: bool):
@@ -154,6 +153,10 @@ def test_memory_v34_labels_write_every_step_keeps_observability_on_evidence_fram
             evidence_subtasks=(v35t.INSPECT,),
             memory_required_subtasks=(v35t.WAIT_L, v35t.WAIT_R),
             write_every_step=every_step,
+        )
+        # Dense layout for both clocks so the comparison isolates the observability rule.
+        build = transforms.BuildMemorySequence(
+            stride=15, action_horizon=15, block_steps=4, occlusion_subtasks=(v35t.CLOSE,), allow_sparse_skip_o=False
         )
         item = build(v35t._sequence_item())
         item["episode_fact_targets"] = np.asarray([0], dtype=np.int32)
@@ -169,6 +172,62 @@ def test_memory_v34_labels_write_every_step_keeps_observability_on_evidence_fram
     # State validity and D anchors are unchanged by the clock choice.
     for key in ("seq_read_state_valid", "seq_read_credit_reachable", "seq_decision_mask", "seq_decay_gap_before"):
         np.testing.assert_array_equal(out[key], ref[key], err_msg=key)
+
+
+def test_write_every_step_requires_dense_windows():
+    """Stage 4e: the skip-O family is not exact once every tick writes, so the sampler/transform
+    must hand MemoryV34Labels(write_every_step=True) dense windows only, and the transform
+    refuses an analytic gap if one slips through."""
+    from openpi.training import data_loader_v35_test as v35t
+
+    def labels(every_step: bool):
+        return transforms.MemoryV34Labels(
+            subtask_vocab=tuple(v35t.VOCAB.values()),
+            evidence_subtasks=(v35t.INSPECT,),
+            memory_required_subtasks=(v35t.WAIT_L, v35t.WAIT_R),
+            write_every_step=every_step,
+        )
+
+    def build(allow_sparse: bool):
+        return transforms.BuildMemorySequence(
+            stride=15, action_horizon=15, block_steps=4, occlusion_subtasks=(v35t.CLOSE,), allow_sparse_skip_o=allow_sparse
+        )
+
+    # The fixture's default start is a skip-O start under the parity split.
+    sparse_item = build(True)(v35t._sequence_item())
+    assert bool(sparse_item["seq_sparse_skip_o"])
+    assert int(np.asarray(sparse_item["seq_decay_gap_before"]).max()) > 0
+    labels(False)(dict(sparse_item))  # evidence-only clock: exact, accepted
+    with pytest.raises(ValueError, match="dense memory windows"):
+        labels(True)(dict(sparse_item))
+
+    # allow_sparse_skip_o=False turns the same start into the natural (dense) layout.
+    dense_item = build(False)(v35t._sequence_item())
+    assert not bool(dense_item["seq_sparse_skip_o"])
+    np.testing.assert_array_equal(dense_item["seq_decay_gap_before"], 0)
+    out = labels(True)(dict(dense_item))
+    np.testing.assert_array_equal(out["seq_write_mask"], out["seq_step_mask"])
+    assert bool(out["seq_decision_mask"].any())
+
+    # Layout helper: sparse family only when allowed.
+    window = v35t._window()
+    assert transforms.memory_critical_is_sparse(1, window)
+    assert not transforms.memory_critical_is_sparse(1, window, allow_sparse=False)
+
+
+def test_config_ties_sparse_family_to_the_write_clock():
+    import dataclasses
+
+    from openpi.training import config as _config
+
+    base = _config.get_config("pi05_yam_mem_v4_stage4e").data.base_config
+    assert base.memory_write_every_step and base.memory_sparse_skip_o_prob == 0.0
+    with pytest.raises(ValueError, match="memory_sparse_skip_o_prob=0.0"):
+        dataclasses.replace(base, memory_sparse_skip_o_prob=0.5)
+    with pytest.raises(ValueError, match="50/50"):
+        dataclasses.replace(base, memory_write_every_step=False)
+    legacy = _config.get_config("pi05_yam_mem_v4_stage4c").data.base_config
+    assert not legacy.memory_write_every_step and legacy.memory_sparse_skip_o_prob == 0.5
 
 
 def test_fact_label_transform_passes_through_inference_items_and_fails_closed():
