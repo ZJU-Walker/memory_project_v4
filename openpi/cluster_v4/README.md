@@ -811,6 +811,54 @@ stays near 4c's ~13-20 per update and `diagnostic/v4_fact_read_accuracy` stays ~
 `v4_fact_loss` should sit near the Stage-1 value (~0.05). The coauthor kit defaults to 4e.
 Switch-over script (kills the 4d launcher + trainer on job 17192955, launches 4e with wandb):
 `bash v4/diagnostics/switch_4d_to_4e.sh` -- run only on the user's decision.
+4d r1 was stopped at 19:06 (user decision) and **4e r1 launched 19:06** (exp
+`v4_stage4e_20260902_r1`, wandb `ayfe2rt2`). Health check passed: update 400 read accuracy
+1.000 / commits 18 / read loss 0.76 (4c: 1.000 / 13 / 0.75; 4d: 0.76 / 27 / 0.87); update
+600 read accuracy 1.000, commits 19, read loss 0.56, fact loss 0.025.
+
+**Training-vs-inference audit (2026-09-02 21:00, user request: "no shortcuts in training,
+fully solve for inference").** Server path = `serve_yam_memory.py --write-policy always`
+(`sample_with_memory`, one tick per client request every 15 frames). Item by item:
+
+| aspect | training (4e) | inference (`always`) | verdict |
+|---|---|---|---|
+| clock | one step per 15 frames, every valid step may write | one tick per 15 frames, `v35_write_mask=1` | match |
+| visual bank | `write_requested = write_mask & transition_valid` -> writes every valid step | `_v35_inference_transition(write_mask=1)` every tick | match |
+| semantic bank | head intent (conf >= 0.9, non-unknown) AND write mask | same gate inside `v4_semantic_write`, mask = 1 | match |
+| fact head input | layer-8 top tokens of the full view (memory-blind: image tokens precede memory tokens) | `prepared["h8_top"]` | match |
+| read-before-write | reads at step t see the state before t's transition | `finish` transitions after sampling | match |
+| decay | one analytic decay per step; gaps only in skip-O windows | one decay per tick, no gaps | **mismatch under every-step writes (fixed below)** |
+| prompt / cameras / stride | episode prompt, 3 cameras, stride 15 | client prompts, 3 cameras, `steps_between_inference=15` | match |
+| labels in the forward pass | none (labels only gate gradients: fact CE targets, `write_grad_observable_only`) | none | match |
+| state-digit mask (v3.4 plan 5.2) | 50% of memory-required segments hide the proprio digits from the TASK view; write dynamics use the full view | digits always present | deliberate regularizer, harder than inference, kept |
+| window start state | windows start with blank banks: full trajectories at frame 0 (30%), critical E->D windows up to 75 frames before E (50%), slices mid-episode (20%) | banks carry the whole episode prefix | **residual gap, see below** |
+| recurrence length | <= 40 steps (bucket cap) | 43-61 steps per episode | residual gap (bounded delta-rule state; closed-loop replays 5/5 on dev) |
+
+Fix (d), the skip-O windows. The v3.5 sparse family compacts the O transitions between the
+last E and the first D into one analytic decay, exact while O never wrote. Under the every-step
+clock the deployed policy writes on every O tick, so 50% of the decision-bearing windows in 4d
+and 4e r1 trained a bank state that never occurs at inference. Now: `memory_sparse_skip_o_prob`
+is 0.5 (parity families, evidence-only recipes) or 0.0 (dense only; REQUIRED when
+`memory_write_every_step`, enforced in `DataConfig.__post_init__`); the sampler and
+`BuildMemorySequence(allow_sparse_skip_o=False)` produce natural layouts only; and
+`MemoryV34Labels(write_every_step=True)` refuses any analytic gap (fail closed). Verified on
+the real loader: 6 batches, max gap 0, no sparse windows, write mask = step mask, observable
+8-25% of steps. Tests: `data_loader_v4_test.py::test_write_every_step_requires_dense_windows`,
+`::test_config_ties_sparse_family_to_the_write_clock`; the v3.5 loader/transform suites
+(51 tests) still pass. The Stage 4d config block was retired (its data recipe is now illegal);
+4d r1 checkpoints evaluate/serve under the 4e config (identical model and inference path).
+**4e r1 (running) still used the skip-O windows; the fix needs a fresh run (4e r2).**
+
+Residual gap, the blank-bank window starts. Episode geometry (54 training episodes): evidence
+frames 180-400, decision (D) frames 383-701 (steps 25-46 at stride 15), length 653-927 frames
+(43-61 steps). A window that starts at frame 0 and reaches the end of D needs up to 47 steps;
+a whole episode up to 61. Two exact options, both cost compute: (i) start every critical
+window at frame 0 and add a 48-step bucket (the D-side recurrent state becomes the true rollout
+state; ~+20% per-sample cost, memory at batch 2 to be verified), or (ii) prefix replay: run the
+write path over the omitted prefix without gradient to seed the window's state (needs loader
++ model support, roughly +50% forward cost). The visual bank is inert for the decision (Stage
+4c battery) and the semantic content is fixed by the E frames inside every critical window, so
+the gap touches the visual bank's non-decision content only; deferred until 4e r2 is measured.
 
 **Sharing the project (2026-09-02).** Code is on GitHub (`git@github.com:ZJU-Walker/
 memory_project_v4.git`, local branch `v4` published as `main`, first push 16:28 into the
