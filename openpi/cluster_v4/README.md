@@ -769,6 +769,49 @@ Two implementations, commit `11d2630`:
   closed-loop battery `--write-policy always` and the side-flip battery
   `--state-mask-prob 0`.
 
+**Stage 4d r1 at update 1000 (18:41): the policy losses track 4c exactly, the semantic
+memory does not.** Log `v4/diagnostics/train_v4_stage4d_20260902_r1.log`:
+
+| update | CE 4d / 4c | flow 4d / 4c | semantic commits per update 4d / 4c | semantic read acc 4d / 4c |
+|---|---|---|---|---|
+| 0 | 15.84 / 15.22 | 0.157 / 0.167 | 18 / 10 | 1.00 / 1.00 |
+| 200 | 4.28 / 4.34 | 0.021 / 0.021 | 27 / 13 | 0.82 / 1.00 |
+| 400 | 3.43 / 3.46 | 0.014 / 0.014 | 27 / 13 | 0.76 / 1.00 |
+| 600 | 2.99 / 3.03 | 0.012 / 0.012 | 59 / 14 | 0.56 / 1.00 |
+| 800 | 2.62 / 2.71 | 0.012 / 0.012 | 97 / 14 | 0.52 / 1.00 |
+| 1000 | 2.33 / (2.43 @900) | 0.011 / 0.011 | 83 / 14 | 0.51 / 1.00 |
+
+Diagnosis. Under the every-step clock each frame on which the FROZEN Stage-1 fact head is
+confident and non-`unknown` commits a semantic write. Two things then go wrong that Stage 4c's
+manifest-gated writes hid: (1) the read-side fact loss back-propagates through every committed
+write (the write content is the head's softmax, differentiable into layer 8), so the trunk is
+pushed to make the head's misfires on non-evidence frames decodable, which makes the head fire
+on more frames (commits 18 -> 97), and the misfires overwrite the slot; (2) nothing supervises
+abstention (`memory_fact_loss_weight=0`, head frozen). The Stage 4 r1 anomaly (commits
+13 -> 43 under the side losses) was the same mechanism with a different driver. A third,
+independent bug: `MemoryV4FactLabels` derived `seq_fact_observable` from `seq_write_mask`, so
+under `write_every_step` every valid frame counted as observable -- harmless for 4d's
+gradients (fact loss weight 0) but it made `v4_fact_loss` meaningless (5-7 instead of 0.05)
+and would have mis-scored the closed-loop battery's evidence frames for 4d configs.
+
+**Stage 4e = the fix (config `pi05_yam_mem_v4_stage4e`; forward/deployment behaviour is
+4d's, only the training gradients change):**
+(a) fact head co-adapts under the Stage-1 objective (class-balanced fact CE with `unknown`
+abstention on every non-observable row, weight 0.5; `fact_*` unfrozen, as Stage 4b);
+(b) observability tied to the evidence frames (`MemoryV34Labels(write_every_step=True)` now
+emits `_v4_evidence_write_mask`, consumed by `MemoryV4FactLabels`);
+(c) `memory_fact_write_grad_observable_only=True`: the write logits carry gradient only on
+observable real slots (stop-gradient elsewhere) = the Stage-4c gradient structure under the
+Stage-4d write schedule. Tests: `data_loader_v4_test.py` (observability under every-step
+clock, private-key hygiene, the MemoryV34Labels -> MemoryV4FactLabels pipeline equals the
+evidence-only reference), `pi0_v4_test.py::test_write_grad_observable_only_routes_the_read_loss_like_evidence_only_writes`
+(forward identical, read-loss gradient into the head exactly zero with no observable frame,
+nonzero on the observable frame). Health signal for a 4e run: `diagnostic/v4_sem_commit_count`
+stays near 4c's ~13-20 per update and `diagnostic/v4_fact_read_accuracy` stays ~1.0;
+`v4_fact_loss` should sit near the Stage-1 value (~0.05). The coauthor kit defaults to 4e.
+Switch-over script (kills the 4d launcher + trainer on job 17192955, launches 4e with wandb):
+`bash v4/diagnostics/switch_4d_to_4e.sh` -- run only on the user's decision.
+
 **Sharing the project (2026-09-02).** Code is on GitHub (`git@github.com:ZJU-Walker/
 memory_project_v4.git`, local branch `v4` published as `main`, first push 16:28 into the
 empty repository; `main` is the only remote ref, the local backup tag `pre-publish-v4` and

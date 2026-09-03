@@ -8,7 +8,7 @@ server and the evaluation scripts expect it):
 The optimizer state (train_state/, ~18 GB) is skipped unless --with-train-state.
 
 Usage:
-  python openpi/cluster_v4/coauthor/upload_checkpoint_to_hf.py                # newest step of the newest stage4d run
+  python openpi/cluster_v4/coauthor/upload_checkpoint_to_hf.py                # newest step of the newest stage4e run
   python openpi/cluster_v4/coauthor/upload_checkpoint_to_hf.py --exp <exp>    # newest step of that run
   python openpi/cluster_v4/coauthor/upload_checkpoint_to_hf.py --checkpoint v4/checkpoints/<config>/<exp>/<step>
       [--repo kewalk123/openpi-v4-memory-artifacts] [--private] [--with-train-state] [--dry-run]
@@ -33,7 +33,7 @@ from huggingface_hub.utils import HfHubHTTPError
 ROOT = pathlib.Path(__file__).resolve().parents[3]  # memory_project/
 DEFAULT_REPO = "kewalk123/openpi-v4-memory-artifacts"
 FALLBACK_REPO_NAME = "openpi-v4-memory-checkpoints"
-DEFAULT_CONFIG = "pi05_yam_mem_v4_stage4d"
+DEFAULT_CONFIG = "pi05_yam_mem_v4_stage4e"
 RUN_FILES = ("v4_run_manifest.json", "initialization_graft_manifest.json", "wandb_id.txt")
 STEP_PATTERNS = ("params/**", "assets/**", "_CHECKPOINT_METADATA")
 

@@ -5,7 +5,7 @@
 #   bash openpi/cluster_v4/coauthor/download_checkpoint.sh <repo> <project-relative step dir> [--root <dir>]
 # e.g.
 #   bash openpi/cluster_v4/coauthor/download_checkpoint.sh kewalk123/openpi-v4-memory-artifacts \
-#        v4/checkpoints/pi05_yam_mem_v4_stage4d/v4_stage4d_20260903_0900/5999
+#        v4/checkpoints/pi05_yam_mem_v4_stage4e/v4_stage4e_20260903_0900/5999
 # The <repo> <step dir> pair is printed by upload_checkpoint_to_hf.py at the end of a training run.
 # Public repos need no token; private ones need `openpi/.venv/bin/huggingface-cli login` or HF_TOKEN.
 set -euo pipefail
@@ -46,7 +46,7 @@ rm -rf "${root}/.cache"
 du -sh "${root}/${rel}" | sed 's/^/[download] size: /'
 
 case "${config}" in
-  *stage4d*) policy=always ;;   # trained with writes on every step: deployment == training
+  *stage4[de]*) policy=always ;;   # trained with writes on every step: deployment == training
   *) policy=head ;;             # Stage-4c and earlier: evidence-only training, gate writes by the fact head
 esac
 cat <<EOF

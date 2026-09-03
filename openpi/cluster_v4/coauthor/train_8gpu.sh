@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Train the v4 dual-bank memory policy on all visible GPUs in ONE process (JAX FSDP; no SLURM,
 # no torchrun). Default: 8 GPUs, global batch 16 (2 samples per GPU, the memory budget proven
-# on 80 GB H100s), config pi05_yam_mem_v4_stage4d (6000 updates, checkpoints every 500).
-#   [GPUS=8] [BATCH=16] [CONFIG=pi05_yam_mem_v4_stage4d] [WANDB=1|0] [EXP=<name>] \
+# on 80 GB H100s), config pi05_yam_mem_v4_stage4e (6000 updates, checkpoints every 500).
+#   [GPUS=8] [BATCH=16] [CONFIG=pi05_yam_mem_v4_stage4e] [WANDB=1|0] [EXP=<name>] \
 #       [WANDB_ENTITY=<team>] bash openpi/cluster_v4/coauthor/train_8gpu.sh [extra train.py args]
 # Resumes automatically if the experiment directory already holds a checkpoint. Logs go to
 # v4/diagnostics/train_<EXP>.log; checkpoints to v4/checkpoints/<CONFIG>/<EXP>/<step>/.
@@ -20,7 +20,7 @@ cd "${root}/openpi"
 source "${root}/openpi/cluster_v35/env.sh"
 mkdir -p "${root}/v4/checkpoints" "${root}/v4/diagnostics"
 
-gpus="${GPUS:-8}"; batch="${BATCH:-16}"; config="${CONFIG:-pi05_yam_mem_v4_stage4d}"
+gpus="${GPUS:-8}"; batch="${BATCH:-16}"; config="${CONFIG:-pi05_yam_mem_v4_stage4e}"
 exp="${EXP:-${config#pi05_yam_mem_}_$(date +%Y%m%d_%H%M)}"
 WANDB="${WANDB:-1}"
 if [ "${WANDB}" = "1" ]; then

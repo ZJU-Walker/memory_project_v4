@@ -12,7 +12,7 @@
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 root="$(cd -- "${here}/../../.." && pwd -P)"
-config="${CONFIG:-pi05_yam_mem_v4_stage4d}"
+config="${CONFIG:-pi05_yam_mem_v4_stage4e}"
 export CONFIG="${config}"
 export EXP="${EXP:-${config#pi05_yam_mem_}_$(date +%Y%m%d_%H%M)}"
 upload="${UPLOAD:-1}"
