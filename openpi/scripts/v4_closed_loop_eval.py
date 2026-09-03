@@ -154,6 +154,13 @@ def main(argv=None) -> None:
         default="semantic",
         help="which bank(s) the reset/donor read overrides act on.",
     )
+    parser.add_argument(
+        "--fact-write-conf",
+        type=float,
+        default=None,
+        help="override the fact head's write-confidence gate (config memory_fact_write_conf, 0.9 in v4) "
+        "for this replay: the serve-time knob, swept to see whether under-confident evidence windows commit.",
+    )
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
 
@@ -183,6 +190,12 @@ def main(argv=None) -> None:
     parameter_tree_sha256 = weight_loaders.parameter_tree_sha256(params)
     model = config.model.load(params)
     model.eval()
+    if args.fact_write_conf is not None:
+        if not 0.0 < args.fact_write_conf <= 1.0:
+            raise SystemExit("--fact-write-conf must lie in (0, 1].")
+        # Python attribute read inside v4_fact_write_intent; static under the jit below.
+        model.memory_fact_write_conf = float(args.fact_write_conf)
+    fact_write_conf = float(model.memory_fact_write_conf)
     loader = data_loader_lib.create_data_loader(
         config, sharding=None, shuffle=True, num_batches=args.batches, exact_resume=False
     )
@@ -497,6 +510,7 @@ def main(argv=None) -> None:
         "split": args.split,
         "intervention_bank": args.bank,
         "write_policy": args.write_policy,
+        "fact_write_conf": fact_write_conf,
         "batches": args.batches,
         "batch_size": args.batch_size,
         "max_decode_steps": args.max_decode_steps,

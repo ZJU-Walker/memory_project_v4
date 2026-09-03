@@ -74,6 +74,11 @@ class Args:
     # module doc. "head" (v4 default) = both banks commit only on frames where the fact head is
     # confident a fact is visible -- the training write schedule without a manifest.
     write_policy: str = "head"
+    # v4 only: override the fact head's write-confidence gate (config memory_fact_write_conf,
+    # 0.9). The semantic bank commits a slot only when the head's top non-`unknown` class is at
+    # least this confident. Lower it only on closed-loop evidence (v4_closed_loop_eval.py
+    # --fact-write-conf sweep): it trades missed evidence windows for wrong-write risk.
+    fact_write_conf: float | None = None
     # Run one synthetic request before serving so the JIT compile (minutes) happens here, not on
     # the robot's first request; the memory is reset afterwards.
     warmup: bool = True
@@ -368,6 +373,13 @@ def create_policy(args: Args) -> MemoryPolicy:
 
     logging.info("Loading model (float32: the memory's inner GD is validated in f32)...")
     model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.float32))
+    if args.fact_write_conf is not None:
+        if not getattr(model, "memory_v4_dual_bank", False):
+            raise ValueError("--fact-write-conf applies to v4 dual-bank checkpoints only.")
+        if not 0.0 < args.fact_write_conf <= 1.0:
+            raise ValueError("--fact-write-conf must lie in (0, 1].")
+        logging.info("Overriding memory_fact_write_conf %.3f -> %.3f", model.memory_fact_write_conf, args.fact_write_conf)
+        model.memory_fact_write_conf = float(args.fact_write_conf)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
@@ -410,6 +422,9 @@ def create_policy(args: Args) -> MemoryPolicy:
         write_policy=args.write_policy,
         fact_names=_load_fact_names(data_config) if getattr(model, "memory_v4_dual_bank", False) else None,
     )
+    if getattr(model, "memory_v4_dual_bank", False):
+        # The effective gate (after --fact-write-conf), so the client shows what the server runs.
+        metadata["memory_fact_write_conf"] = float(model.memory_fact_write_conf)
     return MemoryPolicy(
         model,
         decode_tokenizer=pg,
