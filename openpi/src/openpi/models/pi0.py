@@ -4704,8 +4704,16 @@ class Pi0(_model.BaseModel):
                             oracle_slot_mask=x["fact_observable"] & fact_label_real,
                         )
                     else:
+                        step_write_logits = write_fact_logits
+                        if getattr(self, "memory_fact_write_grad_observable_only", False):
+                            # Same forward value; gradient reaches the trunk only through
+                            # observable real slots (the Stage-4c gradient structure).
+                            grad_slots = (x["fact_observable"] & fact_label_real)[..., None]
+                            step_write_logits = jnp.where(
+                                grad_slots, write_fact_logits, jax.lax.stop_gradient(write_fact_logits)
+                            )
                         sem_write_state, sem_aux = self.v4_semantic_write(
-                            sem_state, write_fact_logits, write_requested
+                            sem_state, step_write_logits, write_requested
                         )
                     sem_state = jax.tree.map(
                         lambda new, old: jnp.where(

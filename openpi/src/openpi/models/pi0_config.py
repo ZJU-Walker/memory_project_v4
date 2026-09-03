@@ -257,6 +257,16 @@ class Pi0Config(_model.BaseModelConfig):
     # objective for the head (the head is frozen in that stage); the 2a/2b gap measures
     # perception error.
     memory_fact_oracle_writes: bool = False
+    # Training-only gradient routing for write-every-step recipes (Stage 4e). The semantic
+    # write content is the head's softmax over the fact logits, so the read-side fact loss
+    # back-propagates through every committed write into the shared layer-8 features. With
+    # evidence-only writes (Stage 4c) that gradient only ever touched observable frames; with
+    # writes allowed on every step (Stage 4d) it also flowed through the head's misfires on
+    # non-observable frames, teaching the trunk to make those misfires decodable: semantic
+    # commits grew 18 -> 97 per update and the read accuracy fell 1.00 -> 0.51 by update 1000.
+    # When True, the write logits carry gradient only on observable (real, visible) slots;
+    # the forward pass (what commits) is unchanged, so deployment == training still holds.
+    memory_fact_write_grad_observable_only: bool = False
     # Stage 2 is semantic-only: the visual bank still writes (state evolves) but injects
     # nothing (content ablation of the visual retrieval) so the fused stream sees only the
     # semantic tokens. The v3.5 gate/calibration contract on the visual path is untouched.

@@ -110,6 +110,67 @@ def test_fact_label_transform_pads_and_masks_with_write_steps():
     assert "episode_fact_targets" not in out
 
 
+def test_fact_label_transform_uses_the_evidence_mask_under_write_every_step():
+    transform = transforms.MemoryV4FactLabels(num_fact_slots=4, num_fact_targets=3)
+    data = {
+        "episode_fact_targets": np.asarray([0, 1], dtype=np.int32),
+        # Write-every-step clock: every valid step may commit ...
+        "seq_write_mask": np.asarray([True, True, True, False]),
+        # ... but the fact is visible only on the single evidence frame.
+        "_v4_evidence_write_mask": np.asarray([False, True, False, False]),
+    }
+    out = transform(data)
+    expected = np.zeros((4, 4), dtype=bool)
+    expected[1, :2] = True
+    np.testing.assert_array_equal(out["seq_fact_observable"], expected)
+    assert "_v4_evidence_write_mask" not in out
+    np.testing.assert_array_equal(out["seq_write_mask"], np.asarray([True, True, True, False]))
+
+    with pytest.raises(ValueError, match="subset of the clock write mask"):
+        transform(
+            {
+                "episode_fact_targets": np.asarray([0], dtype=np.int32),
+                "seq_write_mask": np.asarray([True, False]),
+                "_v4_evidence_write_mask": np.asarray([False, True]),
+            }
+        )
+    # Inference items drop the private selector too.
+    out = transform({"_v4_evidence_write_mask": np.asarray([True]), "state": np.zeros(2)})
+    assert "_v4_evidence_write_mask" not in out
+
+
+def test_memory_v34_labels_write_every_step_keeps_observability_on_evidence_frames():
+    """MemoryV34Labels(write_every_step=True) -> MemoryV4FactLabels: the clock covers every
+    valid step, observability stays exactly the evidence-only write mask (Stage 4e fix; Stage
+    4d r1 derived it from the clock and marked every frame observable)."""
+    from openpi.training import data_loader_v35_test as v35t
+
+    build = transforms.BuildMemorySequence(stride=15, action_horizon=15, block_steps=4, occlusion_subtasks=(v35t.CLOSE,))
+    facts = transforms.MemoryV4FactLabels(num_fact_slots=2, num_fact_targets=3)
+
+    def run(every_step: bool):
+        labels = transforms.MemoryV34Labels(
+            subtask_vocab=tuple(v35t.VOCAB.values()),
+            evidence_subtasks=(v35t.INSPECT,),
+            memory_required_subtasks=(v35t.WAIT_L, v35t.WAIT_R),
+            write_every_step=every_step,
+        )
+        item = build(v35t._sequence_item())
+        item["episode_fact_targets"] = np.asarray([0], dtype=np.int32)
+        return facts(labels(item))
+
+    out, ref = run(True), run(False)
+    np.testing.assert_array_equal(out["seq_write_mask"], out["seq_step_mask"])
+    np.testing.assert_array_equal(out["seq_fact_observable"][:, 0], ref["seq_write_mask"])
+    np.testing.assert_array_equal(out["seq_fact_observable"], ref["seq_fact_observable"])
+    assert out["seq_write_mask"].sum() > out["seq_fact_observable"][:, 0].sum() > 0
+    assert "_v4_evidence_write_mask" not in out
+    assert "_v4_evidence_write_mask" not in ref
+    # State validity and D anchors are unchanged by the clock choice.
+    for key in ("seq_read_state_valid", "seq_read_credit_reachable", "seq_decision_mask", "seq_decay_gap_before"):
+        np.testing.assert_array_equal(out[key], ref[key], err_msg=key)
+
+
 def test_fact_label_transform_passes_through_inference_items_and_fails_closed():
     transform = transforms.MemoryV4FactLabels(num_fact_slots=4, num_fact_targets=3)
     # Inference item: no sequence fields; the episode metadata is dropped, nothing emitted.

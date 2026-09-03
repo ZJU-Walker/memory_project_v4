@@ -949,6 +949,10 @@ class MemoryV34Labels(DataTransformFn):
                 )
 
             data["seq_write_mask"] = write_mask
+            if self.write_every_step:
+                # Fact observability must stay tied to the evidence frames, not to the clock
+                # mask. MemoryV4FactLabels (next in the pipeline) consumes and removes this.
+                data["_v4_evidence_write_mask"] = evidence_write
             data["seq_decision_mask"] = decision_mask
             data["seq_read_state_valid"] = state_valid
             data["seq_read_credit_reachable"] = credit_reachable
@@ -994,6 +998,9 @@ class MemoryV4FactLabels(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         targets = data.pop("episode_fact_targets", None)
+        # Under MemoryV34Labels(write_every_step=True) the clock mask covers every valid step;
+        # the evidence-only mask arrives separately and defines observability instead.
+        evidence_write = data.pop("_v4_evidence_write_mask", None)
         if "seq_write_mask" not in data:
             return data
         if targets is None:
@@ -1011,9 +1018,18 @@ class MemoryV4FactLabels(DataTransformFn):
         write_mask = np.asarray(data["seq_write_mask"], dtype=bool)
         if write_mask.ndim != 1:
             raise ValueError(f"seq_write_mask must be per-step [T], got shape {write_mask.shape}.")
+        if evidence_write is not None:
+            evidence_write = np.asarray(evidence_write, dtype=bool)
+            if evidence_write.shape != write_mask.shape:
+                raise ValueError("_v4_evidence_write_mask must have the same shape as seq_write_mask.")
+            if np.any(evidence_write & ~write_mask):
+                raise ValueError("evidence write steps must be a subset of the clock write mask.")
+            observable_steps = evidence_write
+        else:
+            observable_steps = write_mask
         populated = padded != unknown
         data["seq_fact_labels"] = padded
-        data["seq_fact_observable"] = write_mask[:, None] & populated[None, :]
+        data["seq_fact_observable"] = observable_steps[:, None] & populated[None, :]
         return data
 
 

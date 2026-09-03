@@ -407,6 +407,43 @@ def test_v4_visual_and_both_interventions_are_read_side_only(tiny_v4_seq):
         run("audio_reset")
 
 
+def test_write_grad_observable_only_routes_the_read_loss_like_evidence_only_writes(tiny_v4_seq):
+    """Stage 4e: under a write-every-step clock the read-side fact loss must not back-propagate
+    through the head's writes on non-observable frames (that path let Stage 4d's misfires
+    reshape layer 8); the forward pass and the observable-frame gradient are unchanged."""
+    actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)
+    every_step = _v4_sequence_observation().replace(seq_write_mask=jnp.asarray([[True, True, True]]))
+    nowhere = every_step.replace(seq_fact_observable=jnp.zeros((1, 3, 3), dtype=bool))
+    original_bias = tiny_v4_seq.fact_logit_head.bias.value
+
+    def read_ce(bias, observation, flag):
+        tiny_v4_seq.memory_fact_write_grad_observable_only = flag
+        tiny_v4_seq.fact_logit_head.bias.value = bias
+        losses = tiny_v4_seq._compute_sequence_loss_v32(jax.random.key(45), observation, actions, train=False)
+        return losses["v4_fact_read_ce_sum"], losses
+
+    try:
+        (ce_off, losses_off), grad_off = jax.value_and_grad(read_ce, has_aux=True)(original_bias, nowhere, False)
+        (ce_on, losses_on), grad_on = jax.value_and_grad(read_ce, has_aux=True)(original_bias, nowhere, True)
+        _, grad_on_observable = jax.value_and_grad(read_ce, has_aux=True)(original_bias, every_step, True)
+    finally:
+        tiny_v4_seq.memory_fact_write_grad_observable_only = False
+        tiny_v4_seq.fact_logit_head.bias.value = original_bias
+
+    # Forward pass identical: the confident head commits on every clock step either way, the
+    # same read terms are supervised and the read CE is the same number.
+    assert float(losses_on["v4_sem_commit_count"]) > 3.0
+    np.testing.assert_array_equal(losses_on["v4_sem_commit_count"], losses_off["v4_sem_commit_count"])
+    np.testing.assert_array_equal(losses_on["v4_fact_read_count"], losses_off["v4_fact_read_count"])
+    assert float(losses_on["v4_fact_read_count"]) > 0.0
+    np.testing.assert_allclose(np.asarray(ce_on), np.asarray(ce_off), rtol=1e-6)
+    # Gradient: without the flag the read loss reaches the head through non-observable writes;
+    # with it, nothing arrives when no frame is observable, and the observable frame still trains.
+    assert float(jnp.linalg.norm(grad_off)) > 0.0
+    np.testing.assert_array_equal(np.asarray(grad_on), 0.0)
+    assert float(jnp.linalg.norm(grad_on_observable)) > 0.0
+
+
 def test_v4_sequence_requires_fact_fields_and_interface_requires_semantic_state(tiny_v4_seq):
     observation = _v35_sequence_observation()
     actions = jnp.zeros((1, 3, 4, 2), dtype=jnp.float32)

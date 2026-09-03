@@ -2575,6 +2575,95 @@ _CONFIGS = [
                 fsdp_devices=1,
             ),
             TrainConfig(
+                name="pi05_yam_mem_v4_stage4e",
+                v4_protocol=True,
+                # Stage 4e (2026-09-02, after Stage 4d r1 update 1000): Stage 4d with the fact
+                # head kept honest under write-every-step. In 4d r1 the action/subtask losses
+                # tracked 4c exactly, but semantic commits grew 18 -> 97 per update while the
+                # semantic read accuracy fell 1.00 -> 0.51: the frozen Stage-1 head fired on
+                # more and more non-evidence frames (the read loss back-propagates through every
+                # committed write into layer 8, and 4d committed on every confident frame), and
+                # nothing supervised abstention (fact loss weight 0). Three changes, all
+                # training-side; the forward/deployment behaviour is 4d's:
+                # (a) the fact head co-adapts under the Stage-1 objective (class-balanced fact CE
+                #     with `unknown` abstention on every non-observable row, weight 0.5; the
+                #     head's parameters are unfrozen, as in Stage 4b);
+                # (b) observability stays tied to the evidence frames (`_v4_evidence_write_mask`
+                #     from MemoryV34Labels) instead of the every-step clock mask, so (a)
+                #     supervises the truth only where the fact is visible;
+                # (c) the write logits carry gradient only on observable real slots
+                #     (`memory_fact_write_grad_observable_only`), i.e. the Stage-4c gradient
+                #     structure under the Stage-4d write schedule.
+                model=dataclasses.replace(
+                    v4_model,
+                    memory_fact_oracle_writes=False,
+                    memory_v4_visual_injection=True,
+                    memory_fact_loss_weight=0.5,
+                    memory_fact_read_loss_weight=0.3,
+                    memory_fact_write_grad_observable_only=True,
+                    memory_sem_injection_c=12.4,
+                    memory_sem_injection_tau=0.02,
+                    memory_sem_injection_gate_init=0.5,
+                    memory_injection_c=12.4,
+                    memory_injection_tau=0.02,
+                    memory_injection_gate_init=0.5,
+                    memory_write_side_loss_weight=1e-6,
+                    memory_read_side_loss_weight=1e-6,
+                ),
+                data=dataclasses.replace(
+                    v4_data,
+                    base_config=dataclasses.replace(
+                        v4_data.base_config,
+                        memory_write_every_step=True,
+                        memory_slice_prob=0.4,
+                    ),
+                ),
+                assets_base_dir=str(_project_paths.project_path(_project_paths.V4_ASSETS_ROOT)),
+                checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V4_CHECKPOINTS_DIR)),
+                freeze_filter=nnx_utils.PathRegex(
+                    r".*(memory/gate|memory_gate|memory_inject_w|memory_sem_inject_w|memory_semantic/gate"
+                    r"|memory_write_side_head|memory_read_side_head"
+                    r"|PaliGemma/img/|PaliGemma/llm/embedder).*"
+                ),
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=200,
+                    peak_lr=5e-5,
+                    decay_steps=10_000,
+                    decay_lr=5e-5,
+                ),
+                optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+                memory_grad_clip=5.0,
+                ema_decay=None,
+                probe_lr=1e-2,
+                weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+                    "gs://openpi-assets/checkpoints/pi05_base/params",
+                    matched_allowlist=(
+                        r"(?!.*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+                    ),
+                    fresh_init_allowlist=(
+                        r".*(?:memory|fact_|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+                    ),
+                ),
+                v4_graft_sources=(
+                    (
+                        r".*(fact_keys|fact_compressor|fact_logit_head|fact_value_embed).*",
+                        str(
+                            _project_paths.project_path(
+                                _project_paths.V4_CHECKPOINTS_DIR
+                                / "pi05_yam_mem_v4_stage1/v4_stage1_20260901_r3_h100/1000/params"
+                            )
+                        ),
+                    ),
+                ),
+                num_train_steps=6_000,
+                save_interval=500,
+                keep_period=500,
+                num_workers=12,
+                fsdp_devices=1,
+            ),
+            TrainConfig(
                 name="pi05_yam_mem_v4_stage4c",
                 v4_protocol=True,
                 # Stage 4c: Stage 4 WITHOUT the v3.5 side supervision of the visual bank.
