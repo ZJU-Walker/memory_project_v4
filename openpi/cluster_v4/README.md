@@ -860,6 +860,27 @@ write path over the omitted prefix without gradient to seed the window's state (
 4c battery) and the semantic content is fixed by the E frames inside every critical window, so
 the gap touches the visual bank's non-decision content only; deferred until 4e r2 is measured.
 
+**Stage 4e r1 finished 2026-09-03 11:04** (exit 0; read accuracy 1.000 and 16-20 semantic commits per
+update from update 300 to 5999; final CE 0.50, flow 0.0054, fact loss 0.012, read loss 0.0001).
+Batteries on ckpt 5999 (dev, 48 windows, 234 decision steps; `closed_loop_4e_r1_5999_{semantic,both}_always/`,
+`side_flip_4e_r1_5999_semantic_sm0/`): closed loop under the deployment path (own writes, `always`):
+0 wrong sides, 97% correct, 3% abstained ("open both lids") -- all 7 abstentions in the 2 windows
+whose evidence frames never reached the 0.9 write gate (bank empty; head accuracy on held-out
+evidence frames 0.89 vs the frozen Stage-1 head's 0.97), read accuracy 1.0, commit write accuracy
+1.0, donor swap flips the spoken decision 0.91 (semantic) / 0.93 (both), reset (blank bank) ->
+abstain 0.89 with 0 wrong guesses (4c guessed at chance under reset), action MSE 0.019 (4c 0.027).
+Both-bank interventions equal the semantic-only ones: nothing but the semantic bank carries the
+side. Side-flip (state mask 0): normal 1.000, mean margin 24.7 nats (4c 14.2), donor margin shift
+25.2 nats, D-flip 0.59 (the own margin now exceeds the swap shift in ~40% of pairs; the free-decode
+flip above is the deployment-relevant number). `--fact-write-conf` was added to the server and to
+`v4_closed_loop_eval.py` (commit 5bf4eda) for a gate sweep (0.8, 0.7; `run_conf_sweep_4e_r1.sh`),
+not yet run: the sweep and the ckpt-3000 closed loop were killed at 12:31 to free the GPU.
+**Robot trial 2 (2026-09-03 12:35, `run_server_v4.sh 8000` now defaulting to 4e/5999, `always`,
+gate 0.9, 10.79.12.252): the user reports it "worked very well"** -- starts from the rest pose
+with "open both lids", commits during the inspection, decides the prompted side after the lids
+close. Trial-1 issues (2) and (3) are resolved by the always-write training clock; (1) improved
+with the 6x budget (action MSE above).
+
 **Sharing the project (2026-09-02).** Code is on GitHub (`git@github.com:ZJU-Walker/
 memory_project_v4.git`, local branch `v4` published as `main`, first push 16:28 into the
 empty repository; `main` is the only remote ref, the local backup tag `pre-publish-v4` and
