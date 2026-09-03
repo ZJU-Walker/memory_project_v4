@@ -881,6 +881,20 @@ with "open both lids", commits during the inspection, decides the prompted side 
 close. Trial-1 issues (2) and (3) are resolved by the always-write training clock; (1) improved
 with the 6x budget (action MSE above).
 
+**First external reproduction (coauthor, Lambda 8xH100 Kubernetes pod, 2026-09-02/03):** Stage 4e,
+5000 updates, global batch 16, ~10.5 s/step, ~14 h, wandb `online_rl_v4` (their entity), final
+checkpoint `4999` on their S3; they ran `train_8gpu.sh` unchanged inside their own entrypoint
+(S3 staging instead of HF, `--fsdp-devices 1` = pure data parallel, `--num-workers 64`,
+`NCCL_NVLS_ENABLE=0`, `--checkpoint-by-completed-updates`). Their notes exposed three kit gaps,
+fixed 2026-09-03 14:50: (1) the manifest's three audit sidecars and the 70 raw per-episode label
+files were not published (training fails closed at dataset setup without them; they rebuilt
+them from the manifest) -> now in `kewalk123/openpi-v4-memory-artifacts` under `data/`,
+fetched and digest-verified by `download_data.sh`; (2) `download_data.sh` copied the Hub repo's
+`README.md`/`.gitattributes` into the project root (clobbering the git README) -> excluded;
+(3) the config's 12 loader workers starve a batch-16 run (107-128 s/step) -> `train_8gpu.sh`
+passes `--num-workers` = 4 per sample (`WORKERS`). Their 4d run showed 139-186 commits per
+update, the 4d failure signature, confirming the diagnosis on independent hardware.
+
 **Sharing the project (2026-09-02).** Code is on GitHub (`git@github.com:ZJU-Walker/
 memory_project_v4.git`, local branch `v4` published as `main`, first push 16:28 into the
 empty repository; `main` is the only remote ref, the local backup tag `pre-publish-v4` and

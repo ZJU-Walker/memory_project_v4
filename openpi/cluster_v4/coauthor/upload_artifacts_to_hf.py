@@ -32,9 +32,17 @@ STAGE4C = "v4/checkpoints/pi05_yam_mem_v4_stage4c/v4_stage4c_20260902_r1/999"
 SMALL_FILES = (
     "data/0830_0831_episode_manifest_v36_frozen.json",
     "data/v4_fact_labels_0830_0831.json",
+    # The manifest's three audit sidecars: the loader verifies their bytes against digests pinned
+    # INSIDE the manifest and refuses to build the dataset without them.
+    "data/0830_0831_episode_manifest_v36_frozen_block_confound.json",
+    "data/0830_0831_episode_manifest_v36_frozen_e_visibility.json",
+    "data/0830_0831_episode_manifest_v36_frozen_d_valid.json",
     "v4/assets/pi05_yam_0830_0831_v36/yam/bin_memory_0830_0831_v36_subtask/norm_stats.json",
     "v4/assets/pi05_yam_0830_0831_v36/yam/bin_memory_0830_0831_v36_subtask/norm_stats_provenance.json",
 )
+# The 70 raw per-episode label files (data/<collection>/<demo>/subtask_labels.json, ~665 KB total):
+# the manifest pins each one's SHA256 (label_sha256) and the loader fails closed on a mismatch.
+LABEL_FILE_GLOB = "data/*/demo*/subtask_labels.json"
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -63,6 +71,18 @@ def main() -> None:
     for rel, digest in digests.items():
         print(f"{digest}  {rel}", flush=True)
         api.upload_file(path_or_fileobj=str(ROOT / rel), path_in_repo=rel, repo_id=args.repo, repo_type="model")
+    label_files = sorted(p.relative_to(ROOT).as_posix() for p in ROOT.glob(LABEL_FILE_GLOB))
+    if len(label_files) != 70:
+        sys.exit(f"expected 70 per-episode label files under {LABEL_FILE_GLOB}, found {len(label_files)}")
+    api.upload_folder(
+        folder_path=str(ROOT / "data"),
+        path_in_repo="data",
+        repo_id=args.repo,
+        repo_type="model",
+        allow_patterns=["*/demo*/subtask_labels.json"],
+        commit_message="upload the 70 per-episode subtask label files",
+    )
+    print(f"uploaded {len(label_files)} per-episode label files", flush=True)
 
     checkpoint_notes = []
     if not args.skip_checkpoints:
@@ -102,11 +122,13 @@ def main() -> None:
             "## Files and SHA256",
             "",
             *[f"- `{rel}`: `{digest}`" for rel, digest in digests.items()],
+            f"- `{LABEL_FILE_GLOB}`: {len(label_files)} raw per-episode label files (each pinned by `label_sha256` in the manifest)",
             *checkpoint_notes,
             "",
             "The manifest and fact-label digests are pinned in `openpi/src/openpi/training/config.py`",
-            "(`memory_episode_manifest_sha256`, `memory_v4_fact_labels_sha256`); training refuses to",
-            "start if they differ.",
+            "(`memory_episode_manifest_sha256`, `memory_v4_fact_labels_sha256`); the three manifest",
+            "sidecars and the 70 label files are pinned inside the manifest itself. Training refuses to",
+            "start if any of them differ.",
             "",
             "## Quick start",
             "",

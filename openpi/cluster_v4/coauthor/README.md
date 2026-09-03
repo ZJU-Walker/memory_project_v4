@@ -27,9 +27,32 @@ first lines of the training log. Metrics every 100 updates, camera views at step
 | 4 | `upload_checkpoint_to_hf.py` | pushes the final checkpoint (params + assets + metadata, ~10 GB; optimizer state skipped), the run manifests and the training log to the Hugging Face Hub, keeping project-relative paths |
 
 Knobs (environment variables): `GPUS` (default 8; must divide 2048, never 3), `BATCH`
-(default 16 = 2 per GPU; use 8 on 40 GB GPUs), `CONFIG` (default `pi05_yam_mem_v4_stage4e`),
-`EXP` (experiment name; `run_all.sh` fixes one so a re-run resumes and the upload finds it),
-`WANDB` (default 1), `WANDB_ENTITY` (default `kewalk-stanford-university`), `UPLOAD` (default 1).
+(default 16 = 2 per GPU; use 8 on 40 GB GPUs), `WORKERS` (data-loader workers, default 4 per
+sample = 64 at batch 16; the loader, not the GPUs, is the bottleneck below that), `CONFIG`
+(default `pi05_yam_mem_v4_stage4e`), `EXP` (experiment name; `run_all.sh` fixes one so a re-run
+resumes and the upload finds it), `WANDB` (default 1), `WANDB_ENTITY` (default
+`kewalk-stanford-university`), `UPLOAD` (default 1). Extra arguments to `train_8gpu.sh` go to
+`scripts/train.py` and win over the script's own flags (last occurrence counts), e.g.
+`--num-train-steps 5000 --save-interval 1000 --checkpoint-by-completed-updates` (final
+checkpoint directory `5000/` instead of `4999/`).
+
+What `download_data.sh` fetches, all verified against digests the training config or the
+manifest pins: the LeRobot dataset (70 episodes), the frozen episode manifest, the v4 fact-label
+sidecar, the manifest's three audit sidecars (`*_block_confound.json`, `*_e_visibility.json`,
+`*_d_valid.json`), the 70 raw per-episode label files (`data/<collection>/<demo>/subtask_labels.json`),
+the norm stats and the Stage-1 head checkpoint. The Pi0.5 base weights, the PaliGemma tokenizer
+and the FAST action tokenizer are fetched by the trainer on first use (internet needed once; for
+an offline pod, run one local training start first and ship `v35/cache/{openpi,huggingface}`).
+
+Troubleshooting (from the first external reproduction, 8xH100 in a Kubernetes pod):
+
+| symptom | cause | fix |
+|---|---|---|
+| `v3.5 <name> report bytes do not match their manifest hash` / `label bytes/hash mismatch` | manifest sidecars or per-episode label files missing | re-run `download_data.sh` (they are in the artifacts repo since 2026-09-03) |
+| 100+ s/step, GPUs idle or spinning in NCCL | data loader starved (12 workers at batch 16) | `WORKERS=64` (the default now) |
+| first collective dies with `Cuda failure 401` / NCCL `transport/nvls.cc` | NVLink SHARP multicast unavailable in the pod | `NCCL_NVLS_ENABLE=0` |
+| `couldn't connect to 'https://huggingface.co'` at the FAST tokenizer | offline pod, empty HF cache | pre-populate `v35/cache/huggingface` (see above) |
+| `README.md` of the clone overwritten | older `download_data.sh` copied the Hub repo's README into the project root | fixed (excluded); `git checkout -- README.md` once |
 
 ## After training: hand the checkpoint over
 

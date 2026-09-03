@@ -62,7 +62,12 @@ mode=(); if [ -d "${ckdir}" ]; then
   if ls "${ckdir}" 2>/dev/null | grep -qE '^[0-9]+$'; then mode=(--resume); else mode=(--overwrite); fi
 fi
 log="${root}/v4/diagnostics/train_${exp}.log"
-echo "[train] ${config} exp=${exp} gpus=${gpus} batch=${batch} wandb=${WANDB} entity=${WANDB_ENTITY:-default} ${mode[*]:-fresh} -> ${log}"
+# Data-loader workers must scale with the global batch: one item is a memory window decoded from a
+# ~600 MB per-episode parquet, and the config's 12 workers only keep up with batch 2 (a batch-16 run
+# with 12 workers sat at 107-128 s/step, GPUs idle). Default 4 per sample; WORKERS overrides.
+workers="${WORKERS:-$((batch * 4))}"
+echo "[train] ${config} exp=${exp} gpus=${gpus} batch=${batch} workers=${workers} wandb=${WANDB} entity=${WANDB_ENTITY:-default} ${mode[*]:-fresh} -> ${log}"
 [ "${WANDB}" = "1" ] && echo "[train] wandb run URL appears in the first lines of ${log} (project openpi, run name ${exp})"
+# Extra "$@" args come last: tyro keeps the LAST occurrence of a repeated flag, so callers can override any of these.
 exec .venv/bin/python scripts/train.py "${config}" --exp-name "${exp}" --batch-size "${batch}" \
-  --gradient-accumulation-steps 1 --fsdp-devices "${gpus}" "${wandb_flag}" "${mode[@]}" "$@" 2>&1 | tee -a "${log}"
+  --gradient-accumulation-steps 1 --fsdp-devices "${gpus}" --num-workers "${workers}" "${wandb_flag}" "${mode[@]}" "$@" 2>&1 | tee -a "${log}"
